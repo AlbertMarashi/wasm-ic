@@ -1,0 +1,47 @@
+/// Thin wrapper around WasmCore for Marlin testbench compatibility.
+///
+/// Strips the parametric `o_stack_depth` port that Marlin's macro
+/// cannot parse (`$clog2(N)` width).
+module WasmCoreTb (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    i_start    : input  logic    ,
+    o_prog_addr: output logic<32>,
+    i_prog_data: input  logic<8> ,
+
+    i_bt_wr_en  : input logic    ,
+    i_bt_wr_addr: input logic<32>,
+    i_bt_wr_data: input logic<32>,
+
+    i_mem_load_en  : input logic    ,
+    i_mem_load_addr: input logic<32>,
+    i_mem_load_data: input logic<8> ,
+
+    o_pc       : output logic<32>,
+    o_running  : output logic    ,
+    o_halted   : output logic    ,
+    o_trap     : output logic    ,
+    o_stack_top: output logic<32>,
+) {
+    inst u_core: WasmCore (
+        i_clk             ,
+        i_rst             ,
+        i_start           ,
+        o_prog_addr       ,
+        i_prog_data       ,
+        i_bt_wr_en        ,
+        i_bt_wr_addr      ,
+        i_bt_wr_data      ,
+        i_mem_load_en     ,
+        i_mem_load_addr   ,
+        i_mem_load_data   ,
+        o_pc              ,
+        o_running         ,
+        o_halted          ,
+        o_trap            ,
+        o_stack_top       ,
+        o_stack_next   : _,
+        o_stack_depth  : _,
+    );
+}

@@ -1,0 +1,24 @@
+[package]
+name = "wasm-ic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wat = "1"
+wasmparser = "0.244"
+wasmtime = "41"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+marlin = { version = "0.10", features = ["veryl"] }
+marlin-veryl = "0.10"
+snafu = "0.8"
+
+[[bin]]
+name = "wasm-compile"
+path = "src/bin/wasm_compile.rs"
+
+[patch.crates-io]
+marlin-veryl = { path = "patches/marlin-veryl" }
+marlin-veryl-macro = { path = "patches/marlin-veryl-macro" }

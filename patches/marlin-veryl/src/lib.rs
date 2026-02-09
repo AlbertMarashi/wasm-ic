@@ -1,0 +1,208 @@
+// Copyright (C) 2024 Ethan Uppal.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public License,
+// v. 2.0. If a copy of the MPL was not distributed with this file, You can
+// obtain one at https://mozilla.org/MPL/2.0/.
+
+use std::{env::current_dir, ffi::OsString, fs, process::Command};
+
+use camino::Utf8PathBuf;
+use marlin_verilator::{
+    eprintln_nocapture, AsVerilatedModel, VerilatorRuntime, VerilatorRuntimeOptions,
+};
+use owo_colors::OwoColorize;
+use snafu::{whatever, OptionExt, ResultExt, Whatever};
+
+#[doc(hidden)]
+pub mod __reexports {
+    pub use libloading;
+    pub use marlin_verilator as verilator;
+}
+
+pub mod prelude {
+    pub use crate as veryl;
+    pub use crate::{VerylRuntime, VerylRuntimeOptions};
+    pub use marlin_veryl_macro::veryl;
+}
+
+const VERYL_TOML: &str = "Veryl.toml";
+
+fn search_for_veryl_toml(mut start: Utf8PathBuf) -> Option<Utf8PathBuf> {
+    while start.parent().is_some() {
+        if start.join(VERYL_TOML).is_file() {
+            return Some(start.join(VERYL_TOML));
+        }
+        start.pop();
+    }
+    None
+}
+
+/// Optional configuration for creating a [`VerylRuntime`]. Usually, you can
+/// just use [`VerylRuntimeOptions::default()`].
+pub struct VerylRuntimeOptions {
+    /// The name of the `veryl` executable, interpreted in some way by the
+    /// OS/shell.
+    pub veryl_executable: OsString,
+
+    /// Whether `veryl build` should be automatically called. This switch is
+    /// useful to disable when, for example, another tool has already
+    /// called `veryl build`.
+    pub call_veryl_build: bool,
+
+    /// See [`VerilatorRuntimeOptions`].
+    pub verilator_options: VerilatorRuntimeOptions,
+}
+
+impl Default for VerylRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            veryl_executable: "veryl".into(),
+            call_veryl_build: false,
+            verilator_options: VerilatorRuntimeOptions::default(),
+        }
+    }
+}
+
+/// Runtime for Veryl code.
+pub struct VerylRuntime {
+    verilator_runtime: VerilatorRuntime,
+}
+
+impl VerylRuntime {
+    /// Creates a new runtime for instantiating Veryl units as Rust objects.
+    /// Does NOT call `veryl build` by defaul because `veryl build` is not
+    /// thread safe. You can enable this with [`VerylRuntimeOptions`] or just
+    /// run it beforehand.
+    pub fn new(options: VerylRuntimeOptions) -> Result<Self, Whatever> {
+        if options.verilator_options.log {
+            log::info!("Searching for Veryl project root");
+        }
+        let Some(veryl_toml_path) = search_for_veryl_toml(
+            current_dir()
+                .whatever_context("Failed to get current directory")?
+                .try_into()
+                .whatever_context("Failed to convert current directory to UTF-8")?,
+        ) else {
+            whatever!("Failed to find {VERYL_TOML} searching from current directory");
+        };
+        let mut veryl_project_path = veryl_toml_path.clone();
+        veryl_project_path.pop();
+
+        if options.call_veryl_build {
+            if options.verilator_options.log {
+                log::info!("Invoking `veryl build` (this may take a while)");
+            }
+
+            let veryl_toml_contents = fs::read_to_string(&veryl_toml_path).whatever_context(
+                format!("Failed to read contents of {VERYL_TOML} at {veryl_toml_path}"),
+            )?;
+            let veryl_toml: toml::Value = toml::from_str(&veryl_toml_contents)
+                .whatever_context(format!("Failed to parse {VERYL_TOML} as a valid TOML file"))?;
+            let veryl_project_name = veryl_toml
+                .get("project")
+                .and_then(|project| project.as_table())
+                .and_then(|project| project.get("name"))
+                .and_then(|name| name.as_str())
+                .whatever_context(format!("{VERYL_TOML} missing `project.name` field"))?;
+
+            eprintln_nocapture!(
+                "{} {veryl_project_name} ({veryl_project_path})",
+                "   Compiling".bold().green()
+            )?;
+
+            let veryl_output = Command::new(options.veryl_executable)
+                .arg("build")
+                .current_dir(&veryl_project_path)
+                .output()
+                .whatever_context("Invocation of veryl failed")?;
+
+            if !veryl_output.status.success() {
+                whatever!(
+                    "Invocation of veryl failed with {}\n\n--- STDOUT ---\n{}\n\n--- STDERR ---\n{}",
+                    veryl_output.status,
+                    String::from_utf8(veryl_output.stdout).unwrap_or_default(),
+                    String::from_utf8(veryl_output.stderr).unwrap_or_default()
+                );
+            }
+        }
+
+        // Determine where Veryl outputs .sv files by reading build.target
+        let veryl_toml_contents_for_target = fs::read_to_string(&veryl_toml_path)
+            .whatever_context(format!(
+                "Failed to read contents of {VERYL_TOML} at {veryl_toml_path}"
+            ))?;
+        let veryl_toml_for_target: toml::Value = toml::from_str(&veryl_toml_contents_for_target)
+            .whatever_context("Failed to parse Veryl.toml")?;
+
+        let sv_search_dirs: Vec<Utf8PathBuf> = if let Some(target) = veryl_toml_for_target
+            .get("build")
+            .and_then(|b| b.get("target"))
+        {
+            let target_type = target
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("source");
+            match target_type {
+                "directory" => {
+                    let path = target
+                        .get("path")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("target");
+                    vec![veryl_project_path.join(path)]
+                }
+                // "source" or "bundle" — scan source directories
+                _ => {
+                    let sources = veryl_toml_for_target
+                        .get("build")
+                        .and_then(|b| b.get("sources"))
+                        .and_then(|s| s.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| veryl_project_path.join(s)))
+                                .collect()
+                        })
+                        .unwrap_or_else(|| vec![veryl_project_path.join("src")]);
+                    sources
+                }
+            }
+        } else {
+            vec![veryl_project_path.join("src")]
+        };
+
+        let mut verilog_source_files = vec![];
+        for dir in &sv_search_dirs {
+            if let Ok(entries) = dir.read_dir_utf8() {
+                for file in entries.flatten() {
+                    if file
+                        .path()
+                        .extension()
+                        .map(|extension| extension == "sv")
+                        .unwrap_or(false)
+                    {
+                        verilog_source_files.push(file.path().to_path_buf());
+                    }
+                }
+            }
+        }
+        let verilog_source_files_ref = verilog_source_files
+            .iter()
+            .map(|path_buf| path_buf.as_path())
+            .collect::<Vec<_>>();
+
+        Ok(Self {
+            verilator_runtime: VerilatorRuntime::new(
+                &veryl_project_path.join("dependencies/whatever"),
+                &verilog_source_files_ref,
+                &[],
+                [],
+                options.verilator_options,
+            )?,
+        })
+    }
+
+    /// Instantiates a new Veryl module. This function simply wraps
+    /// [`VerilatorRuntime::create_model`].
+    pub fn create_model<'ctx, M: AsVerilatedModel<'ctx>>(&'ctx self) -> Result<M, Whatever> {
+        self.verilator_runtime.create_model_simple()
+    }
+}
