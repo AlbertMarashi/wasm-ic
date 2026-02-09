@@ -1,0 +1,6 @@
+module ModuleA (
+    i_data: input  logic<10>,
+    o_data: output logic<10>,
+) {
+    assign o_data = i_data;
+}

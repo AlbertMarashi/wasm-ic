@@ -1,0 +1,56 @@
+/// Shared types for the WASM ALU.
+///
+/// Contains the AluOp enum which selects which operation the ALU performs.
+/// Each variant maps 1:1 to a WASM i32 instruction. The decoder module
+/// (not yet built) will translate raw WASM opcode bytes into these values.
+package WasmAluPkg {
+
+    /// ALU operation selector for WASM i32 instructions.
+    ///
+    /// 5-bit encoding (29 of 32 values used). Grouped by category:
+    ///   0-6:   arithmetic (add, sub, mul, div, rem)
+    ///   7-9:   bitwise (and, or, xor)
+    ///   10-14: shifts and rotates
+    ///   15-24: comparisons (eq, ne, lt, gt, le, ge in signed/unsigned)
+    ///   25-28: unary (eqz, clz, ctz, popcnt)
+    enum AluOp: logic<5> {
+        // Arithmetic -- binary ops, pop 2 operands, push 1 result
+        Add, // i32.add
+        Sub, // i32.sub
+        Mul, // i32.mul
+        DivS, // i32.div_s -- traps on div-by-zero or INT32_MIN/-1
+        DivU, // i32.div_u -- traps on div-by-zero
+        RemS, // i32.rem_s -- traps on div-by-zero
+        RemU, // i32.rem_u -- traps on div-by-zero
+
+        // Bitwise -- binary ops
+        And, // i32.and
+        Or, // i32.or
+        Xor, // i32.xor
+
+        // Shifts & Rotates -- binary ops, shift amount masked to 5 bits (mod 32)
+        Shl, // i32.shl   -- shift left
+        ShrS, // i32.shr_s -- arithmetic shift right (sign-extends)
+        ShrU, // i32.shr_u -- logical shift right (zero-fills)
+        Rotl, // i32.rotl  -- rotate left
+        Rotr, // i32.rotr  -- rotate right
+
+        // Comparison -- binary ops, result is 0 or 1 (zero-extended to 32 bits)
+        Eq, // i32.eq
+        Ne, // i32.ne
+        LtS, // i32.lt_s  -- signed less than
+        LtU, // i32.lt_u  -- unsigned less than
+        GtS, // i32.gt_s
+        GtU, // i32.gt_u
+        LeS, // i32.le_s
+        LeU, // i32.le_u
+        GeS, // i32.ge_s
+        GeU, // i32.ge_u
+
+        // Unary -- use i_lhs only, i_rhs is ignored
+        Eqz, // i32.eqz    -- 1 if lhs == 0, else 0
+        Clz, // i32.clz    -- count leading zeros (32 if all zeros)
+        Ctz, // i32.ctz    -- count trailing zeros (32 if all zeros)
+        Popcnt, // i32.popcnt -- number of 1-bits
+    }
+}

@@ -1,0 +1,424 @@
+/// WASM operand stack with TOS/NOS register caching.
+///
+/// WASM is a stack machine: arithmetic instructions pop operands and push results.
+/// This module implements a LIFO stack with zero-latency access to the top two
+/// elements (TOS and NOS), enabling single-cycle binary ALU operations.
+///
+/// The stack supports simultaneous push and pop in the same cycle:
+///   - push + pop2: binary ALU op (pop 2 operands, push 1 result) -- net: sp -= 1
+///   - push + pop:  unary ALU op (pop 1 operand, push 1 result)  -- net: replace TOS
+///   - push alone:  i32.const, local.get, memory load
+///   - pop alone:   local.set, drop, br_if condition consume
+///
+/// Architecture:
+///   TOS and NOS are held in dedicated registers (not in the array).
+///   The backing array (stack[0..DEPTH-3]) stores elements below NOS.
+///   A stack pointer (sp) tracks how many elements are in the backing array.
+///   On push, the old NOS spills into the array. On pop, NOS is refilled from it.
+///
+/// Future work:
+///   - For large DEPTH, the register array should be replaced with block RAM.
+///     This would add 1 cycle of read latency for pop, requiring a prefetch buffer.
+///   - Call frame save/restore for function calls (snapshot sp, push locals).
+module WasmStack #(
+    param DEPTH: u32 = 1024,
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    /// Push i_data onto the stack
+    i_push: input logic,
+    /// Data to push
+    i_data: input logic<32>,
+
+    /// Pop 1 value from the stack
+    i_pop: input logic,
+    /// Pop 2 values from the stack (for binary ops)
+    i_pop2: input logic,
+
+    /// Value at top of stack (always available)
+    o_top: output logic<32>,
+    /// Value below top of stack (always available)
+    o_next: output logic<32>,
+
+    /// Stack is empty (depth == 0)
+    o_empty: output logic,
+    /// Stack is full (depth == DEPTH)
+    o_full: output logic,
+    /// Current number of elements on the stack
+    o_depth: output logic<$clog2(DEPTH + 1)>,
+
+    /// Error: attempted to pop from empty stack
+    o_underflow: output logic,
+    /// Error: attempted to push to full stack
+    o_overflow: output logic,
+) {
+    // Backing store for elements below NOS.
+    // TOS and NOS are in dedicated registers, so the array holds DEPTH-2 elements max.
+    const DEPTH_WIDTH: u32 = $clog2(DEPTH + 1);
+    const ARRAY_DEPTH: u32 = DEPTH - 2;
+    const SP_WIDTH   : u32 = if ARRAY_DEPTH >= 2 ? $clog2(ARRAY_DEPTH) : 1;
+
+    // DEPTH cast to the depth counter's bit width, for comparison without width warnings
+    const MAX_DEPTH: logic<DEPTH_WIDTH> = DEPTH as DEPTH_WIDTH;
+
+    var mem: logic<32> [ARRAY_DEPTH];
+
+    // Stack pointer: number of valid elements in mem[]
+    // (does NOT count TOS or NOS -- total depth = sp + count of valid TOS/NOS)
+    var sp: logic<SP_WIDTH>;
+
+    // How many elements are on the stack total (0..DEPTH)
+    var depth: logic<$clog2(DEPTH + 1)>;
+
+    // TOS and NOS registers
+    var tos: logic<32>;
+    var nos: logic<32>;
+
+    // Outputs
+    assign o_top   = tos;
+    assign o_next  = nos;
+    assign o_depth = depth;
+    assign o_empty = depth == 0;
+    assign o_full  = depth == MAX_DEPTH;
+
+    // Error detection (active for one cycle when the illegal operation happens)
+    var underflow  : logic;
+    var overflow   : logic;
+    assign o_underflow = underflow;
+    assign o_overflow  = overflow;
+
+    always_comb {
+        // Pop from empty stack
+        underflow = 0;
+        if (i_pop || i_pop2) && depth == 0 {
+            underflow = 1;
+        }
+        if i_pop2 && depth <: 2 {
+            underflow = 1;
+        }
+        if i_pop && !i_push && depth <: 1 {
+            underflow = 1;
+        }
+
+        // Push to full stack
+        overflow = 0;
+        if i_push && !i_pop && !i_pop2 && depth == MAX_DEPTH {
+            overflow = 1;
+        }
+    }
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            tos   = 0;
+            nos   = 0;
+            sp    = 0;
+            depth = 0;
+        } else {
+
+            // push + pop2: binary ALU pattern (pop 2, push 1 result)
+            // net effect: depth -= 1, TOS = new data, NOS = mem[sp-1]
+            if i_push && i_pop2 {
+                if depth >= 2 {
+                    tos = i_data;
+                    if sp >: 0 {
+                        nos = mem[sp - 1];
+                        sp  = sp - 1;
+                    } else {
+                        nos = 0;
+                    }
+                    depth = depth - 1;
+                }
+
+                // push + pop: unary ALU pattern (replace TOS)
+                // net effect: depth unchanged, TOS = new data, NOS unchanged
+            } else if i_push && i_pop {
+                if depth >= 1 {
+                    tos = i_data;
+                }
+
+                // push only
+            } else if i_push {
+                if depth <: MAX_DEPTH {
+                    // Spill NOS into backing array
+                    if depth >= 2 {
+                        mem[sp] = nos;
+                        sp      = sp + 1;
+                    }
+                    nos   = tos;
+                    tos   = i_data;
+                    depth = depth + 1;
+                }
+
+                // pop2 only (rare, but supported)
+            } else if i_pop2 {
+                if depth >= 2 {
+                    if sp >= 2 {
+                        tos = mem[sp - 1];
+                        nos = mem[sp - 2];
+                        sp  = sp - 2;
+                    } else if sp == 1 {
+                        tos = mem[sp - 1];
+                        nos = 0;
+                        sp  = 0;
+                    } else {
+                        tos = 0;
+                        nos = 0;
+                    }
+                    depth = depth - 2;
+                }
+
+                // pop only
+            } else if i_pop {
+                if depth >= 1 {
+                    tos = nos;
+                    if sp >: 0 {
+                        nos = mem[sp - 1];
+                        sp  = sp - 1;
+                    } else {
+                        nos = 0;
+                    }
+                    depth = depth - 1;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Testbench -- exercises all stack operations including simultaneous push+pop.
+// Uses a small DEPTH=8 stack for fast, exhaustive testing.
+// Run with: veryl test --sim verilator
+// ---------------------------------------------------------------------------
+#[test(test_wasm_stack)]
+embed (inline) sv{{{
+module test_wasm_stack;
+    logic        clk, rst;
+    logic        push, pop, pop2;
+    logic [31:0] data_in;
+    logic [31:0] top, next;
+    logic        empty, full;
+    logic [3:0]  depth;
+    logic        underflow, overflow;
+    int          pass_count, fail_count;
+
+    hello_WasmStack #(.DEPTH(8)) u_stack (
+        .i_clk       (clk      ),
+        .i_rst       (rst      ),
+        .i_push      (push     ),
+        .i_data      (data_in  ),
+        .i_pop       (pop      ),
+        .i_pop2      (pop2     ),
+        .o_top       (top      ),
+        .o_next      (next     ),
+        .o_empty     (empty    ),
+        .o_full      (full     ),
+        .o_depth     (depth    ),
+        .o_underflow (underflow),
+        .o_overflow  (overflow )
+    );
+
+    // Clock generation: 10 time unit period
+    initial clk = 0;
+    always #5 clk = ~clk;
+
+    // Helper: apply inputs then wait for next rising edge
+    task do_cycle(
+        input        t_push,
+        input        t_pop,
+        input        t_pop2,
+        input [31:0] t_data
+    );
+        push    = t_push;
+        pop     = t_pop;
+        pop2    = t_pop2;
+        data_in = t_data;
+        @(posedge clk);
+        #1; // small delay to let combinational outputs settle
+    endtask
+
+    task idle();
+        do_cycle(0, 0, 0, 0);
+    endtask
+
+    task check(
+        input string name,
+        input [31:0] exp_top,
+        input [31:0] exp_next,
+        input [3:0]  exp_depth,
+        input        exp_empty,
+        input        exp_full
+    );
+        if (top !== exp_top || next !== exp_next || depth !== exp_depth ||
+            empty !== exp_empty || full !== exp_full) begin
+            $error("%s: top=%08h next=%08h depth=%0d empty=%0b full=%0b | expected top=%08h next=%08h depth=%0d empty=%0b full=%0b",
+                   name, top, next, depth, empty, full,
+                   exp_top, exp_next, exp_depth, exp_empty, exp_full);
+            fail_count++;
+        end else begin
+            pass_count++;
+        end
+    endtask
+
+    initial begin
+        pass_count = 0;
+        fail_count = 0;
+        push = 0; pop = 0; pop2 = 0; data_in = 0;
+
+        // --- Reset ---
+        rst = 0;
+        @(posedge clk); #1;
+        rst = 1;
+        idle();
+        check("after_reset", 0, 0, 0, 1, 0);
+
+        // --- Push 1 element ---
+        do_cycle(1, 0, 0, 32'hAAAA_0001);
+        check("push_1", 32'hAAAA_0001, 0, 1, 0, 0);
+
+        // --- Push 2nd element ---
+        do_cycle(1, 0, 0, 32'hAAAA_0002);
+        check("push_2", 32'hAAAA_0002, 32'hAAAA_0001, 2, 0, 0);
+
+        // --- Push 3rd element ---
+        do_cycle(1, 0, 0, 32'hAAAA_0003);
+        check("push_3", 32'hAAAA_0003, 32'hAAAA_0002, 3, 0, 0);
+
+        // --- Push 4th element ---
+        do_cycle(1, 0, 0, 32'hAAAA_0004);
+        check("push_4", 32'hAAAA_0004, 32'hAAAA_0003, 4, 0, 0);
+
+        // --- Pop 1 ---
+        do_cycle(0, 1, 0, 0);
+        check("pop_to_3", 32'hAAAA_0003, 32'hAAAA_0002, 3, 0, 0);
+
+        // --- Pop 1 again ---
+        do_cycle(0, 1, 0, 0);
+        check("pop_to_2", 32'hAAAA_0002, 32'hAAAA_0001, 2, 0, 0);
+
+        // --- Pop 1 again ---
+        do_cycle(0, 1, 0, 0);
+        check("pop_to_1", 32'hAAAA_0001, 0, 1, 0, 0);
+
+        // --- Pop to empty ---
+        do_cycle(0, 1, 0, 0);
+        check("pop_to_0", 0, 0, 0, 1, 0);
+
+        // =============================================
+        // Test push+pop (unary ALU pattern: replace TOS)
+        // =============================================
+        // Push 2 values first
+        do_cycle(1, 0, 0, 32'h0000_0010);
+        do_cycle(1, 0, 0, 32'h0000_0020);
+        check("before_unary", 32'h0000_0020, 32'h0000_0010, 2, 0, 0);
+
+        // push+pop: replace TOS with new value, NOS unchanged
+        do_cycle(1, 1, 0, 32'h0000_00FF);
+        check("unary_replace", 32'h0000_00FF, 32'h0000_0010, 2, 0, 0);
+
+        // Clean up
+        do_cycle(0, 1, 0, 0);
+        do_cycle(0, 1, 0, 0);
+        check("cleaned_up", 0, 0, 0, 1, 0);
+
+        // =============================================
+        // Test push+pop2 (binary ALU pattern)
+        // =============================================
+        // Push 3 values: stack = [10, 20, 30] (30 on top)
+        do_cycle(1, 0, 0, 32'd10);
+        do_cycle(1, 0, 0, 32'd20);
+        do_cycle(1, 0, 0, 32'd30);
+        check("before_binary", 32'd30, 32'd20, 3, 0, 0);
+
+        // push+pop2: simulates "add" -> pop 30 and 20, push 50
+        // stack should be: [10, 50] (50 on top)
+        do_cycle(1, 0, 1, 32'd50);
+        check("binary_add", 32'd50, 32'd10, 2, 0, 0);
+
+        // Another binary op: pop 50 and 10, push 60
+        // stack should be: [60]
+        do_cycle(1, 0, 1, 32'd60);
+        check("binary_add2", 32'd60, 0, 1, 0, 0);
+
+        // Clean up
+        do_cycle(0, 1, 0, 0);
+        check("binary_cleaned", 0, 0, 0, 1, 0);
+
+        // =============================================
+        // Test pop2 alone
+        // =============================================
+        do_cycle(1, 0, 0, 32'hBBBB_0001);
+        do_cycle(1, 0, 0, 32'hBBBB_0002);
+        do_cycle(1, 0, 0, 32'hBBBB_0003);
+        do_cycle(1, 0, 0, 32'hBBBB_0004);
+        check("before_pop2", 32'hBBBB_0004, 32'hBBBB_0003, 4, 0, 0);
+
+        do_cycle(0, 0, 1, 0);
+        check("after_pop2", 32'hBBBB_0002, 32'hBBBB_0001, 2, 0, 0);
+
+        do_cycle(0, 0, 1, 0);
+        check("pop2_to_empty", 0, 0, 0, 1, 0);
+
+        // =============================================
+        // Test fill to full (DEPTH=8)
+        // =============================================
+        for (int i = 1; i <= 8; i++) begin
+            do_cycle(1, 0, 0, i);
+        end
+        check("full_stack", 32'd8, 32'd7, 8, 0, 1);
+
+        // Overflow: push when full
+        do_cycle(1, 0, 0, 32'hDEAD);
+        if (!overflow) begin
+            $error("overflow not asserted on push to full stack");
+            fail_count++;
+        end else begin
+            pass_count++;
+        end
+        // Stack should be unchanged
+        check("after_overflow", 32'd8, 32'd7, 8, 0, 1);
+
+        // Pop everything
+        for (int i = 0; i < 8; i++) begin
+            do_cycle(0, 1, 0, 0);
+        end
+        check("empty_after_drain", 0, 0, 0, 1, 0);
+
+        // Underflow: pop when empty
+        do_cycle(0, 1, 0, 0);
+        if (!underflow) begin
+            $error("underflow not asserted on pop from empty stack");
+            fail_count++;
+        end else begin
+            pass_count++;
+        end
+
+        // =============================================
+        // Test full ALU simulation: compute (3 + 5) * 2
+        // Instruction sequence:
+        //   i32.const 3   -> push 3
+        //   i32.const 5   -> push 5
+        //   i32.add       -> pop2+push (3+5=8)
+        //   i32.const 2   -> push 2
+        //   i32.mul       -> pop2+push (8*2=16)
+        // =============================================
+        do_cycle(1, 0, 0, 32'd3);    // push 3
+        do_cycle(1, 0, 0, 32'd5);    // push 5
+        check("alu_before_add", 32'd5, 32'd3, 2, 0, 0);
+
+        do_cycle(1, 0, 1, 32'd8);    // pop2+push 8 (simulated add result)
+        check("alu_after_add", 32'd8, 0, 1, 0, 0);
+
+        do_cycle(1, 0, 0, 32'd2);    // push 2
+        check("alu_before_mul", 32'd2, 32'd8, 2, 0, 0);
+
+        do_cycle(1, 0, 1, 32'd16);   // pop2+push 16 (simulated mul result)
+        check("alu_after_mul", 32'd16, 0, 1, 0, 0);
+
+        $display("=== WASM Stack Test Complete: %0d passed, %0d failed ===", pass_count, fail_count);
+        if (fail_count > 0)
+            $error("FAIL: %0d tests failed", fail_count);
+        $finish;
+    end
+endmodule
+}}}

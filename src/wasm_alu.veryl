@@ -1,0 +1,290 @@
+/// Combinational ALU implementing all WASM i32 arithmetic, logic, comparison,
+/// and unary operations.
+///
+/// This is a pure combinational module (no clock/reset). Given an operation
+/// selector and two 32-bit operands, it produces a 32-bit result in the same
+/// cycle. For unary operations (eqz, clz, ctz, popcnt) only i_lhs is used.
+///
+/// The o_trap output signals an illegal operation:
+///   - Division or remainder by zero (div_s, div_u, rem_s, rem_u with rhs == 0)
+///   - Signed division overflow (i32.div_s with lhs == INT32_MIN and rhs == -1)
+/// When o_trap is high, o_result is undefined.
+///
+/// Future work:
+///   - Split into separate fast ALU (1-cycle) and slow divider (multi-cycle)
+///     to improve max clock frequency. Currently div/rem are combinational
+///     which creates a very long critical path.
+///   - Parameterize width to support i64 operations.
+///   - Add i32.extend8_s, i32.extend16_s sign-extension instructions.
+module WasmAlu (
+    i_op    : input  WasmAluPkg::AluOp    , /// Operation select (see WasmAluPkg::AluOp)
+    i_lhs   : input  logic            <32>, /// Left operand (or sole operand for unary ops)
+    i_rhs   : input  logic            <32>, /// Right operand (ignored for unary ops)
+    o_result: output logic            <32>, /// Computation result
+    o_trap  : output logic                , /// Trap signal (division by zero / signed overflow)
+) {
+    import WasmAluPkg::*;
+
+    // Signed 32-bit type alias -- used for signed division, remainder,
+    // arithmetic right shift, and signed comparisons.
+    type s32 = signed logic<32>;
+
+    // WASM spec: shift/rotate amounts are taken mod 32 (i.e. bottom 5 bits)
+    let shamt: logic<5> = i_rhs[4:0];
+
+    // Reinterpret operands as signed for signed operations
+    var lhs_s: s32;
+    var rhs_s: s32;
+    assign lhs_s = i_lhs as s32;
+    assign rhs_s = i_rhs as s32;
+
+    // Intermediate for signed division/remainder/shift results
+    // before casting back to unsigned for o_result
+    var signed_result: s32;
+
+    // Trap conditions
+    let div_by_zero    : logic = i_rhs == 0;
+    let signed_overflow: logic = (i_lhs == 32'h8000_0000) && (i_rhs == 32'hFFFF_FFFF);
+
+    /// Count leading zeros. Returns 32 if input is all zeros.
+    /// Synthesizes to a priority encoder scanning from MSB to LSB.
+    function Clz32 (
+        a: input logic<32>,
+    ) -> logic<32> {
+        var count: logic<32>;
+        count = 32;
+        for i: u32 in 0..32 {
+            if a[31 - i] == 1'b1 {
+                count = i;
+                break;
+            }
+        }
+        return count;
+    }
+
+    /// Count trailing zeros. Returns 32 if input is all zeros.
+    /// Synthesizes to a priority encoder scanning from LSB to MSB.
+    function Ctz32 (
+        a: input logic<32>,
+    ) -> logic<32> {
+        var count: logic<32>;
+        count = 32;
+        for i: u32 in 0..32 {
+            if a[i] == 1'b1 {
+                count = i;
+                break;
+            }
+        }
+        return count;
+    }
+
+    /// Population count (number of set bits). Returns 0-32.
+    /// Synthesizes to an adder tree.
+    function Popcnt32 (
+        a: input logic<32>,
+    ) -> logic<32> {
+        var count: logic<32>;
+        count = 0;
+        for i: u32 in 0..32 {
+            if a[i] == 1'b1 {
+                count = count + 1;
+            }
+        }
+        return count;
+    }
+
+    always_comb {
+        o_result      = 0;
+        o_trap        = 0;
+        signed_result = 0;
+
+        case i_op {
+            // --- Arithmetic ---
+            AluOp::Add : o_result = i_lhs + i_rhs;
+            AluOp::Sub : o_result = i_lhs - i_rhs;
+            AluOp::Mul : o_result = i_lhs * i_rhs;
+            AluOp::DivU: {
+                if div_by_zero {
+                    o_trap = 1;
+                } else {
+                    o_result = i_lhs / i_rhs;
+                }
+            }
+            AluOp::DivS: {
+                if div_by_zero || signed_overflow {
+                    o_trap = 1;
+                } else {
+                    signed_result = lhs_s / rhs_s;
+                    o_result      = signed_result as 32;
+                }
+            }
+            AluOp::RemU: {
+                if div_by_zero {
+                    o_trap = 1;
+                } else {
+                    o_result = i_lhs % i_rhs;
+                }
+            }
+            AluOp::RemS: {
+                if div_by_zero {
+                    o_trap = 1;
+                } else {
+                    signed_result = lhs_s % rhs_s;
+                    o_result      = signed_result as 32;
+                }
+            }
+
+            // --- Bitwise ---
+            AluOp::And: o_result = i_lhs & i_rhs;
+            AluOp::Or : o_result = i_lhs | i_rhs;
+            AluOp::Xor: o_result = i_lhs ^ i_rhs;
+
+            // --- Shifts (amount mod 32 via shamt) ---
+            AluOp::Shl : o_result = i_lhs << shamt;
+            AluOp::ShrU: o_result = i_lhs >> shamt;
+            AluOp::ShrS: {
+                signed_result = lhs_s >>> shamt;
+                o_result      = signed_result as 32;
+            }
+
+            // --- Rotates (amount mod 32 via shamt) ---
+            // rotl: (x << n) | (x >> (32-n))
+            // rotr: (x >> n) | (x << (32-n))
+            // Uses 6-bit literal for 32 since 5 bits can't hold 32.
+            AluOp::Rotl: o_result = (i_lhs << shamt) | (i_lhs >> (6'd32 - {1'b0, shamt}));
+            AluOp::Rotr: o_result = (i_lhs >> shamt) | (i_lhs << (6'd32 - {1'b0, shamt}));
+
+            // --- Comparison (result is 0 or 1, zero-extended to 32 bits) ---
+            AluOp::Eq : o_result = {31'b0, i_lhs == i_rhs};
+            AluOp::Ne : o_result = {31'b0, i_lhs != i_rhs};
+            AluOp::LtU: o_result = {31'b0, i_lhs <: i_rhs};
+            AluOp::GtU: o_result = {31'b0, i_lhs >: i_rhs};
+            AluOp::LeU: o_result = {31'b0, i_lhs <= i_rhs};
+            AluOp::GeU: o_result = {31'b0, i_lhs >= i_rhs};
+            AluOp::LtS: o_result = {31'b0, lhs_s <: rhs_s};
+            AluOp::GtS: o_result = {31'b0, lhs_s >: rhs_s};
+            AluOp::LeS: o_result = {31'b0, lhs_s <= rhs_s};
+            AluOp::GeS: o_result = {31'b0, lhs_s >= rhs_s};
+
+            // --- Unary (only i_lhs is used) ---
+            AluOp::Eqz   : o_result = {31'b0, i_lhs == 0};
+            AluOp::Clz   : o_result = Clz32(i_lhs);
+            AluOp::Ctz   : o_result = Ctz32(i_lhs);
+            AluOp::Popcnt: o_result = Popcnt32(i_lhs);
+
+            default: {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Testbench -- exercises every ALU operation with representative test vectors.
+// Run with: veryl test --sim verilator
+// ---------------------------------------------------------------------------
+#[test(test_wasm_alu)]
+embed (inline) sv{{{
+module test_wasm_alu;
+    import hello_WasmAluPkg::*;
+
+    AluOp          op;
+    logic [31:0]   lhs, rhs, result;
+    logic          trap;
+    int            pass_count, fail_count;
+
+    hello_WasmAlu u_alu (
+        .i_op     (op    ),
+        .i_lhs    (lhs   ),
+        .i_rhs    (rhs   ),
+        .o_result (result),
+        .o_trap   (trap  )
+    );
+
+    task check(
+        input string   name,
+        input AluOp    t_op,
+        input [31:0]   t_lhs,
+        input [31:0]   t_rhs,
+        input [31:0]   t_expect,
+        input          t_trap
+    );
+        op  = t_op;
+        lhs = t_lhs;
+        rhs = t_rhs;
+        #1;
+        if (result !== t_expect || trap !== t_trap) begin
+            $error("%s: lhs=%08h rhs=%08h => got result=%08h trap=%0b, expected result=%08h trap=%0b",
+                   name, t_lhs, t_rhs, result, trap, t_expect, t_trap);
+            fail_count++;
+        end else begin
+            pass_count++;
+        end
+    endtask
+
+    initial begin
+        pass_count = 0;
+        fail_count = 0;
+
+        // --- Arithmetic ---
+        check("add",           AluOp_Add,  32'd10,         32'd20,         32'd30,         0);
+        check("add_overflow",  AluOp_Add,  32'hFFFFFFFF,   32'd1,          32'd0,          0);
+        check("sub",           AluOp_Sub,  32'd20,         32'd7,          32'd13,         0);
+        check("sub_underflow", AluOp_Sub,  32'd0,          32'd1,          32'hFFFFFFFF,   0);
+        check("mul",           AluOp_Mul,  32'd6,          32'd7,          32'd42,         0);
+        check("divu",          AluOp_DivU, 32'd100,        32'd7,          32'd14,         0);
+        check("divu_by_zero",  AluOp_DivU, 32'd100,        32'd0,          32'd0,          1);
+        check("divs",          AluOp_DivS, 32'hFFFFFFF6,   32'd2,          32'hFFFFFFFB,   0); // -10 / 2 = -5
+        check("divs_by_zero",  AluOp_DivS, 32'd100,        32'd0,          32'd0,          1);
+        check("divs_overflow", AluOp_DivS, 32'h80000000,   32'hFFFFFFFF,   32'd0,          1); // INT_MIN / -1
+        check("remu",          AluOp_RemU, 32'd100,        32'd7,          32'd2,          0);
+        check("remu_by_zero",  AluOp_RemU, 32'd100,        32'd0,          32'd0,          1);
+        check("rems",          AluOp_RemS, 32'hFFFFFFF6,   32'd3,          32'hFFFFFFFF,   0); // -10 % 3 = -1
+        check("rems_by_zero",  AluOp_RemS, 32'd100,        32'd0,          32'd0,          1);
+
+        // --- Bitwise ---
+        check("and",  AluOp_And, 32'hFF00FF00, 32'h0F0F0F0F, 32'h0F000F00, 0);
+        check("or",   AluOp_Or,  32'hFF00FF00, 32'h0F0F0F0F, 32'hFF0FFF0F, 0);
+        check("xor",  AluOp_Xor, 32'hFF00FF00, 32'h0F0F0F0F, 32'hF00FF00F, 0);
+
+        // --- Shifts ---
+        check("shl",       AluOp_Shl,  32'h00000001, 32'd4,  32'h00000010, 0);
+        check("shl_mod32", AluOp_Shl,  32'h00000001, 32'd33, 32'h00000002, 0); // 33 mod 32 = 1
+        check("shru",      AluOp_ShrU, 32'h80000000, 32'd4,  32'h08000000, 0);
+        check("shrs",      AluOp_ShrS, 32'h80000000, 32'd4,  32'hF8000000, 0); // sign-extends
+
+        // --- Rotates ---
+        check("rotl",  AluOp_Rotl, 32'h80000001, 32'd4,  32'h00000018, 0);
+        check("rotr",  AluOp_Rotr, 32'h80000001, 32'd4,  32'h18000000, 0);
+
+        // --- Comparison ---
+        check("eq_true",  AluOp_Eq,  32'd5, 32'd5, 32'd1, 0);
+        check("eq_false", AluOp_Eq,  32'd5, 32'd6, 32'd0, 0);
+        check("ne_true",  AluOp_Ne,  32'd5, 32'd6, 32'd1, 0);
+        check("ne_false", AluOp_Ne,  32'd5, 32'd5, 32'd0, 0);
+        check("ltu",      AluOp_LtU, 32'd3, 32'd5, 32'd1, 0);
+        check("ltu_eq",   AluOp_LtU, 32'd5, 32'd5, 32'd0, 0);
+        check("gtu",      AluOp_GtU, 32'd5, 32'd3, 32'd1, 0);
+        check("leu",      AluOp_LeU, 32'd5, 32'd5, 32'd1, 0);
+        check("geu",      AluOp_GeU, 32'd5, 32'd5, 32'd1, 0);
+        check("lts",      AluOp_LtS, 32'hFFFFFFFF, 32'd0, 32'd1, 0); // -1 < 0
+        check("gts",      AluOp_GtS, 32'd0, 32'hFFFFFFFF, 32'd1, 0); // 0 > -1
+        check("les",      AluOp_LeS, 32'hFFFFFFFF, 32'hFFFFFFFF, 32'd1, 0); // -1 <= -1
+        check("ges",      AluOp_GeS, 32'd0, 32'hFFFFFFFF, 32'd1, 0); // 0 >= -1
+
+        // --- Unary ---
+        check("eqz_true",  AluOp_Eqz,    32'd0,          32'd0, 32'd1,  0);
+        check("eqz_false", AluOp_Eqz,    32'd42,         32'd0, 32'd0,  0);
+        check("clz_zero",  AluOp_Clz,    32'd0,          32'd0, 32'd32, 0);
+        check("clz",       AluOp_Clz,    32'h00F00000,   32'd0, 32'd8,  0);
+        check("ctz_zero",  AluOp_Ctz,    32'd0,          32'd0, 32'd32, 0);
+        check("ctz",       AluOp_Ctz,    32'h00F00000,   32'd0, 32'd20, 0);
+        check("popcnt",    AluOp_Popcnt, 32'hDEADBEEF,   32'd0, 32'd24, 0);
+        check("popcnt_0",  AluOp_Popcnt, 32'd0,          32'd0, 32'd0,  0);
+        check("popcnt_ff", AluOp_Popcnt, 32'hFFFFFFFF,   32'd0, 32'd32, 0);
+
+        $display("=== WASM ALU Test Complete: %0d passed, %0d failed ===", pass_count, fail_count);
+        if (fail_count > 0)
+            $error("FAIL: %0d tests failed", fail_count);
+        $finish;
+    end
+endmodule
+}}}
