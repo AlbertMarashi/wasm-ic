@@ -1,0 +1,383 @@
+/// WASM linear memory -- flat byte-addressable RAM.
+///
+/// Provides the backing store for WASM load/store instructions. Internally
+/// a byte array. Supports 1-byte, 2-byte, and 4-byte access with sign/zero
+/// extension for sub-word loads.
+///
+/// Read port is combinational (zero-latency). Write port is synchronous
+/// (commits on clock edge). A separate loader port allows the off-chip
+/// loader to populate initial memory contents (data sections) before
+/// execution begins.
+///
+/// Byte order is little-endian per the WASM spec.
+module WasmMemory #(
+    param SIZE: u32 = 4096, /// Number of bytes
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // Loader write port (byte-at-a-time, before execution)
+    i_load_en  : input logic    , /// Loader write enable
+    i_load_addr: input logic<32>, /// Loader byte address
+    i_load_data: input logic<8> , /// Loader byte data
+
+    // Read port (combinational)
+    i_rd_addr  : input  logic<32>, /// Byte address
+    i_rd_size  : input  logic<2> , /// 0=byte, 1=half, 2=word
+    i_rd_signed: input  logic    , /// 1=sign-extend, 0=zero-extend
+    o_rd_data  : output logic<32>, /// Assembled + extended result
+    o_rd_trap  : output logic    , /// Read address out of bounds
+
+    // Write port (synchronous)
+    i_wr_en  : input  logic    , /// Write enable
+    i_wr_addr: input  logic<32>, /// Byte address
+    i_wr_size: input  logic<2> , /// 0=byte, 1=half, 2=word
+    i_wr_data: input  logic<32>, /// Data to write (low bytes used)
+    o_wr_trap: output logic    , /// Write address out of bounds
+) {
+    // Storage
+    const ADDR_WIDTH: u32             = $clog2(SIZE);
+    var mem       : logic<8> [SIZE];
+
+    // Access size in bytes
+    var rd_bytes: logic<3>;
+    var wr_bytes: logic<3>;
+
+    always_comb {
+        case i_rd_size {
+            2'd0   : rd_bytes = 3'd1;
+            2'd1   : rd_bytes = 3'd2;
+            2'd2   : rd_bytes = 3'd4;
+            default: rd_bytes = 3'd1;
+        }
+        case i_wr_size {
+            2'd0   : wr_bytes = 3'd1;
+            2'd1   : wr_bytes = 3'd2;
+            2'd2   : wr_bytes = 3'd4;
+            default: wr_bytes = 3'd1;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Bounds checking
+    // ---------------------------------------------------------------
+    assign o_rd_trap = (i_rd_addr + {29'b0, rd_bytes}) >: SIZE;
+    assign o_wr_trap = i_wr_en && ((i_wr_addr + {29'b0, wr_bytes}) >: SIZE);
+
+    // ---------------------------------------------------------------
+    // Combinational read -- little-endian assembly + sign/zero extend
+    // ---------------------------------------------------------------
+    let rd_idx: logic<ADDR_WIDTH> = i_rd_addr[ADDR_WIDTH - 1:0];
+
+    var raw_byte: logic<8> ;
+    var raw_half: logic<16>;
+    var raw_word: logic<32>;
+
+    always_comb {
+        raw_byte = mem[rd_idx];
+        raw_half = {mem[rd_idx + 1], mem[rd_idx]};
+        raw_word = {mem[rd_idx + 3], mem[rd_idx + 2], mem[rd_idx + 1], mem[rd_idx]};
+
+        case i_rd_size {
+            2'd0: { // byte
+                if i_rd_signed && raw_byte[7] {
+                    o_rd_data = {24'hFF_FFFF, raw_byte};
+                } else {
+                    o_rd_data = {24'h00_0000, raw_byte};
+                }
+            }
+            2'd1: { // halfword
+                if i_rd_signed && raw_half[15] {
+                    o_rd_data = {16'hFFFF, raw_half};
+                } else {
+                    o_rd_data = {16'h0000, raw_half};
+                }
+            }
+            2'd2: { // word
+                o_rd_data = raw_word;
+            }
+            default: {
+                o_rd_data = {24'h00_0000, raw_byte};
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Synchronous write -- little-endian decomposition
+    // ---------------------------------------------------------------
+    let load_idx: logic<ADDR_WIDTH> = i_load_addr[ADDR_WIDTH - 1:0];
+    let wr_idx  : logic<ADDR_WIDTH> = i_wr_addr[ADDR_WIDTH - 1:0];
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            // No reset of memory contents (too large, not needed)
+        } else {
+            if i_load_en {
+                mem[load_idx] = i_load_data;
+            } else if i_wr_en && !o_wr_trap {
+                case i_wr_size {
+                    2'd0: { // byte
+                        mem[wr_idx] = i_wr_data[7:0];
+                    }
+                    2'd1: { // halfword
+                        mem[wr_idx]     = i_wr_data[7:0];
+                        mem[wr_idx + 1] = i_wr_data[15:8];
+                    }
+                    2'd2: { // word
+                        mem[wr_idx]     = i_wr_data[7:0];
+                        mem[wr_idx + 1] = i_wr_data[15:8];
+                        mem[wr_idx + 2] = i_wr_data[23:16];
+                        mem[wr_idx + 3] = i_wr_data[31:24];
+                    }
+                    default: {
+                        mem[wr_idx] = i_wr_data[7:0];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Testbench
+// Run with: veryl test --sim verilator
+// ---------------------------------------------------------------------------
+#[test(test_wasm_memory)]
+embed (inline) sv{{{
+module test_wasm_memory;
+    logic        clk, rst;
+    logic        load_en;
+    logic [31:0] load_addr;
+    logic [7:0]  load_data;
+    logic [31:0] rd_addr, rd_data;
+    logic [1:0]  rd_size;
+    logic        rd_signed, rd_trap;
+    logic        wr_en, wr_trap;
+    logic [31:0] wr_addr, wr_data;
+    logic [1:0]  wr_size;
+    int          pass_count, fail_count;
+
+    hello_WasmMemory #(.SIZE(64)) u_mem (
+        .i_clk       (clk      ),
+        .i_rst       (rst      ),
+        .i_load_en   (load_en  ),
+        .i_load_addr (load_addr),
+        .i_load_data (load_data),
+        .i_rd_addr   (rd_addr  ),
+        .i_rd_size   (rd_size  ),
+        .i_rd_signed (rd_signed),
+        .o_rd_data   (rd_data  ),
+        .o_rd_trap   (rd_trap  ),
+        .i_wr_en     (wr_en    ),
+        .i_wr_addr   (wr_addr  ),
+        .i_wr_size   (wr_size  ),
+        .i_wr_data   (wr_data  ),
+        .o_wr_trap   (wr_trap  )
+    );
+
+    // Clock
+    initial clk = 0;
+    always #5 clk = ~clk;
+
+    // ---------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------
+    task do_reset();
+        rst = 0;
+        @(posedge clk); #1;
+        rst = 1;
+        @(posedge clk); #1;
+        load_en = 0; wr_en = 0;
+        rd_addr = 0; rd_size = 0; rd_signed = 0;
+    endtask
+
+    task loader_write(input [31:0] addr, input [7:0] data);
+        load_en   = 1;
+        load_addr = addr;
+        load_data = data;
+        @(posedge clk); #1;
+        load_en = 0;
+    endtask
+
+    task write_mem(input [31:0] addr, input [1:0] size, input [31:0] data);
+        wr_en   = 1;
+        wr_addr = addr;
+        wr_size = size;
+        wr_data = data;
+        @(posedge clk); #1;
+        wr_en = 0;
+    endtask
+
+    task check_read(input string name, input [31:0] addr, input [1:0] size,
+                    input sgn, input [31:0] expected);
+        rd_addr   = addr;
+        rd_size   = size;
+        rd_signed = sgn;
+        #1; // combinational settle
+        if (rd_data !== expected) begin
+            $error("%s: addr=%0d size=%0d signed=%0b data=0x%08h | expected 0x%08h",
+                   name, addr, size, sgn, rd_data, expected);
+            fail_count++;
+        end else begin
+            pass_count++;
+        end
+    endtask
+
+    initial begin
+        pass_count = 0;
+        fail_count = 0;
+        load_en = 0; wr_en = 0;
+
+        do_reset();
+
+        // =========================================================
+        // Test 1: Loader write + byte read
+        // =========================================================
+        loader_write(0, 8'hAB);
+        loader_write(1, 8'hCD);
+        loader_write(2, 8'hEF);
+        loader_write(3, 8'h01);
+
+        check_read("t1_byte0", 0, 2'd0, 0, 32'h000000AB);
+        check_read("t1_byte1", 1, 2'd0, 0, 32'h000000CD);
+        check_read("t1_byte2", 2, 2'd0, 0, 32'h000000EF);
+        check_read("t1_byte3", 3, 2'd0, 0, 32'h00000001);
+
+        // =========================================================
+        // Test 2: Halfword read (little-endian)
+        // =========================================================
+        check_read("t2_half0", 0, 2'd1, 0, 32'h0000CDAB);
+        check_read("t2_half2", 2, 2'd1, 0, 32'h000001EF);
+
+        // =========================================================
+        // Test 3: Word read (little-endian)
+        // =========================================================
+        check_read("t3_word0", 0, 2'd2, 0, 32'h01EFCDAB);
+
+        // =========================================================
+        // Test 4: Sign extension -- byte
+        // =========================================================
+        loader_write(10, 8'h80); // -128 as signed byte
+        loader_write(11, 8'h7F); // +127
+
+        check_read("t4_s_byte_neg", 10, 2'd0, 1, 32'hFFFFFF80);
+        check_read("t4_s_byte_pos", 11, 2'd0, 1, 32'h0000007F);
+        check_read("t4_u_byte_neg", 10, 2'd0, 0, 32'h00000080);
+
+        // =========================================================
+        // Test 5: Sign extension -- halfword
+        // =========================================================
+        loader_write(20, 8'h00);
+        loader_write(21, 8'h80); // 0x8000 = -32768 as signed half
+
+        check_read("t5_s_half_neg", 20, 2'd1, 1, 32'hFFFF8000);
+        check_read("t5_u_half_neg", 20, 2'd1, 0, 32'h00008000);
+
+        loader_write(22, 8'hFF);
+        loader_write(23, 8'h7F); // 0x7FFF = +32767
+
+        check_read("t5_s_half_pos", 22, 2'd1, 1, 32'h00007FFF);
+
+        // =========================================================
+        // Test 6: Synchronous write -- byte
+        // =========================================================
+        write_mem(30, 2'd0, 32'h000000DE);
+        check_read("t6_wr_byte", 30, 2'd0, 0, 32'h000000DE);
+
+        // =========================================================
+        // Test 7: Synchronous write -- halfword
+        // =========================================================
+        write_mem(32, 2'd1, 32'h0000BEEF);
+        check_read("t7_wr_half_lo", 32, 2'd0, 0, 32'h000000EF);
+        check_read("t7_wr_half_hi", 33, 2'd0, 0, 32'h000000BE);
+        check_read("t7_wr_half",    32, 2'd1, 0, 32'h0000BEEF);
+
+        // =========================================================
+        // Test 8: Synchronous write -- word
+        // =========================================================
+        write_mem(40, 2'd2, 32'hDEADBEEF);
+        check_read("t8_wr_word", 40, 2'd2, 0, 32'hDEADBEEF);
+        check_read("t8_byte0",  40, 2'd0, 0, 32'h000000EF);
+        check_read("t8_byte1",  41, 2'd0, 0, 32'h000000BE);
+        check_read("t8_byte2",  42, 2'd0, 0, 32'h000000AD);
+        check_read("t8_byte3",  43, 2'd0, 0, 32'h000000DE);
+
+        // =========================================================
+        // Test 9: Bounds check -- read
+        // =========================================================
+        rd_addr = 64; rd_size = 2'd0; #1; // byte at addr 64 = exactly out of bounds (SIZE=64)
+        if (rd_trap !== 1) begin
+            $error("t9_rd_oob: trap=%0b expected 1", rd_trap);
+            fail_count++;
+        end else pass_count++;
+
+        rd_addr = 63; rd_size = 2'd0; #1; // byte at 63 = last valid byte
+        if (rd_trap !== 0) begin
+            $error("t9_rd_last: trap=%0b expected 0", rd_trap);
+            fail_count++;
+        end else pass_count++;
+
+        rd_addr = 62; rd_size = 2'd1; #1; // half at 62 = bytes 62,63 = OK
+        if (rd_trap !== 0) begin
+            $error("t9_rd_half_ok: trap=%0b expected 0", rd_trap);
+            fail_count++;
+        end else pass_count++;
+
+        rd_addr = 63; rd_size = 2'd1; #1; // half at 63 = bytes 63,64 = OOB
+        if (rd_trap !== 1) begin
+            $error("t9_rd_half_oob: trap=%0b expected 1", rd_trap);
+            fail_count++;
+        end else pass_count++;
+
+        rd_addr = 61; rd_size = 2'd2; #1; // word at 61 = bytes 61..64 = OOB
+        if (rd_trap !== 1) begin
+            $error("t9_rd_word_oob: trap=%0b expected 1", rd_trap);
+            fail_count++;
+        end else pass_count++;
+
+        rd_addr = 60; rd_size = 2'd2; #1; // word at 60 = bytes 60..63 = OK
+        if (rd_trap !== 0) begin
+            $error("t9_rd_word_ok: trap=%0b expected 0", rd_trap);
+            fail_count++;
+        end else pass_count++;
+
+        // =========================================================
+        // Test 10: Bounds check -- write (should not write when OOB)
+        // =========================================================
+        // Write a known value at addr 60
+        write_mem(60, 2'd2, 32'h12345678);
+        check_read("t10_before", 60, 2'd2, 0, 32'h12345678);
+
+        // Attempt OOB write at addr 62 (word = 62..65, OOB)
+        wr_en = 1; wr_addr = 62; wr_size = 2'd2; wr_data = 32'hFFFFFFFF;
+        @(posedge clk); #1;
+        wr_en = 0;
+
+        // Bytes 60-63 should be unchanged
+        check_read("t10_after", 60, 2'd2, 0, 32'h12345678);
+
+        // =========================================================
+        // Test 11: store8 only writes low byte
+        // =========================================================
+        write_mem(50, 2'd2, 32'hAABBCCDD); // fill 4 bytes
+        write_mem(50, 2'd0, 32'h000000FF); // store8: only byte 0
+        check_read("t11_store8", 50, 2'd2, 0, 32'hAABBCCFF);
+
+        // =========================================================
+        // Test 12: store16 only writes low 2 bytes
+        // =========================================================
+        write_mem(50, 2'd2, 32'hAABBCCDD); // fill 4 bytes
+        write_mem(50, 2'd1, 32'h0000EEFF); // store16: bytes 0-1
+        check_read("t12_store16", 50, 2'd2, 0, 32'hAABBEEFF);
+
+        // =========================================================
+        // Summary
+        // =========================================================
+        $display("=== WASM Memory Test Complete: %0d passed, %0d failed ===",
+                 pass_count, fail_count);
+        if (fail_count > 0)
+            $error("FAIL: %0d tests failed", fail_count);
+        $finish;
+    end
+endmodule
+}}}

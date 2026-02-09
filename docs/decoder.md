@@ -3,22 +3,62 @@
 **File**: `src/wasm_decode.veryl`
 
 The decoder (`WasmDecode`) is a purely combinational module that translates a raw WASM
-opcode byte into control signals for the ALU and stack. No clock, no state -- it's
-essentially a big lookup table.
+opcode byte into control signals for the ALU, stack, and fetch unit. No clock, no state
+-- it's essentially a big lookup table.
 
 ## Interface
 
 ```
-               ┌────────────┐
-  i_opcode ───>│            ├──> o_alu_op    (which ALU operation)
-     (8-bit)   │ WasmDecode ├──> o_alu_en    (ALU should execute)
-               │            ├──> o_push      (push result to stack)
-               │            ├──> o_pop       (pop 1 value)
-               │            ├──> o_pop2      (pop 2 values)
-               │            ├──> o_is_const  (i32.const instruction)
-               │            ├──> o_is_return (return instruction)
-               │            ├──> o_trap      (invalid/unreachable)
-               └────────────┘
+               ┌──────────────────────────────────────────────┐
+               │              WasmDecode                      │
+               │         (purely combinational)               │
+               │                                              │
+               │   ALU control ────────────────────────────┐  │
+  i_opcode ───>│     o_alu_op  [5]  (which ALU operation)  │  │
+    [8]        │     o_alu_en  [1]  (ALU should execute)   │  │
+               │                                           ├──┼──>
+               │   Stack control ──────────────────────────┤  │
+               │     o_push    [1]  (push result)          │  │
+               │     o_pop     [1]  (pop 1 value)          │  │
+               │     o_pop2    [1]  (pop 2 values)         │  │
+               │                                           │  │
+               │   Instruction type ───────────────────────┤  │
+               │     o_is_const  [1]  (i32.const)          │  │
+               │     o_is_return [1]  (return)             │  │
+               │     o_trap      [1]  (invalid/unreachable)│  │
+               │                                           │  │
+               │   Control flow ───────────────────────────┘  │
+               │     o_is_block  [1]  (block / loop)          │
+               │     o_is_if     [1]  (if)                    │
+               │     o_is_else   [1]  (else)                  │
+               │     o_is_end    [1]  (end)                   │
+               │     o_is_br     [1]  (br)                    │
+               │     o_is_br_if  [1]  (br_if)                 │
+               └──────────────────────────────────────────────┘
+```
+
+### Signal activation by instruction type
+
+Which outputs fire for each category of instruction:
+
+```
+                  alu  alu         is_  is_  is_  is_  is_  is_
+                  _en  _op  push pop pop2 const ret trap blk  if else end br br_if
+  ─────────────── ───  ─── ──── ─── ──── ──── ─── ──── ──── ── ──── ─── ── ─────
+  nop                                                    
+  unreachable                                  ●         
+  return                              ●                  
+  drop                        ●                          
+  i32.const                ●              ●              
+  unary ALU       ●    ●   ●   ●                         
+  binary ALU      ●    ●   ●        ●                    
+  block / loop                                      ●    
+  if                        ●                        ●   
+  else                                                ●  
+  end                                                  ● 
+  br                                                    ●
+  br_if                     ●                             ●
+  invalid opcode                           ●         
 ```
 
 | Port | Direction | Width | Description |
@@ -32,8 +72,14 @@ essentially a big lookup table.
 | `o_is_const` | output | 1 | Instruction is `i32.const` (immediate follows) |
 | `o_is_return` | output | 1 | Instruction is `return` |
 | `o_trap` | output | 1 | Instruction is `unreachable` or unrecognized |
+| `o_is_block` | output | 1 | `block` or `loop` (block type byte follows) |
+| `o_is_if` | output | 1 | `if` -- conditional block, pops TOS as condition |
+| `o_is_else` | output | 1 | `else` -- unconditional jump to end of if/else |
+| `o_is_end` | output | 1 | `end` -- close current block |
+| `o_is_br` | output | 1 | `br` -- unconditional branch, LEB128 depth follows |
+| `o_is_br_if` | output | 1 | `br_if` -- conditional branch, pops TOS, LEB128 depth follows |
 
-## Supported opcodes (34 total)
+## Supported opcodes (41 total)
 
 ### Control instructions
 
@@ -42,6 +88,29 @@ essentially a big lookup table.
 | `0x00` | `unreachable` | `trap=1` |
 | `0x01` | `nop` | all zeros |
 | `0x0F` | `return` | `is_return=1` |
+
+### Control flow
+
+| Opcode | Instruction | Signals |
+|--------|-------------|---------|
+| `0x02` | `block` | `is_block=1` |
+| `0x03` | `loop` | `is_block=1` |
+| `0x04` | `if` | `is_if=1, pop=1` |
+| `0x05` | `else` | `is_else=1` |
+| `0x0B` | `end` | `is_end=1` |
+| `0x0C` | `br` | `is_br=1` |
+| `0x0D` | `br_if` | `is_br_if=1, pop=1` |
+
+`block` and `loop` both set `is_block=1` -- the fetch unit handles them identically
+(skip the block type byte and continue). The distinction between forward (`block`) and
+backward (`loop`) jumps is resolved by the branch table, not the decoder.
+
+`if` and `br_if` set `pop=1` because they consume TOS as a condition value. The fetch
+unit latches the condition during the EXEC state and uses it later to decide whether
+to jump via the branch table.
+
+`br` and `br_if` have a LEB128 immediate (the branch depth) in the bytecode. The fetch
+unit reads and discards it -- the actual target PC comes from the branch table.
 
 ### Stack manipulation
 
@@ -110,12 +179,13 @@ values, including future WASM instructions we haven't implemented yet.
   `i32.const`. It just sets `o_is_const=1` and `o_push=1` to tell the fetch unit
   "read an LEB128 immediate next" and the stack "you'll be getting a push."
 
-- **Future expansion**: Adding new opcodes (e.g., memory load/store, control flow)
+- **Future expansion**: Adding new opcodes (e.g., memory load/store, function calls)
   means adding more cases and possibly new output signals (e.g., `o_mem_read`,
-  `o_branch`).
+  `o_is_call`).
 
 ## Test coverage
 
-The embedded testbench (`test_wasm_decode`) verifies all 34 supported opcodes plus 3
-invalid opcodes (0x02, 0x80, 0xFF). Each test checks the exact combination of output
-signals expected for that instruction category.
+The embedded testbench (`test_wasm_decode`) verifies all 41 supported opcodes plus 3
+invalid opcodes (0x06, 0x42, 0xFF). Each test checks the exact combination of output
+signals expected for that instruction category, including the 7 control flow opcodes
+and their associated `pop` signals for `if` and `br_if`.

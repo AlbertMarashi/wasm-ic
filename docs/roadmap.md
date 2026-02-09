@@ -1,5 +1,42 @@
 # Roadmap
 
+## Module dependency graph
+
+```
+  ╔═══════════╗   ╔═══════════╗
+  ║  AluPkg   ║   ║   Stack   ║
+  ║  (enums)  ║   ║  (LIFO)   ║
+  ╚═════╤═════╝   ╚═════╤═════╝
+        │               │
+        v               │
+  ╔═══════════╗         │          ╔══════════════╗
+  ║  Decode   ║         │          ║ Branch Table ║
+  ║ (signals) ║         │          ║   (RAM)      ║
+  ╚═════╤═════╝         │          ╚══════╤═══════╝
+        │               │                 │
+        v               │                 v
+  ╔═══════════════════════════════════════════════╗
+  ║                  Fetch                        ║
+  ║          (PC, FSM, LEB128, control flow)      ║
+  ╚═══════════════════════╤═══════════════════════╝
+                          │
+                          v
+            ┌───────────────────────────┐
+            │       Top-level Core      │
+            │  (wires everything + new  │
+            │   modules below)          │
+            └──────┬──────────┬─────────┘
+                   │          │
+                   v          v
+            ┌──────────┐  ┌──────────┐
+            │  Linear  │  │   Call   │
+            │  Memory  │  │  Stack   │
+            └──────────┘  └──────────┘
+
+  ═══ double border = implemented
+  ─── single border = planned
+```
+
 ## Completed
 
 1. **ALU** -- Combinational i32 ALU with all 29 arithmetic, bitwise, comparison, shift,
@@ -8,20 +45,20 @@
 2. **Operand Stack** -- Synchronous LIFO with TOS/NOS register caching for single-cycle
    ALU operations. See [Stack docs](stack.md).
 
-3. **Decoder** -- Combinational opcode-to-control-signal translation for 34 WASM opcodes.
-   See [Decoder docs](decoder.md).
+3. **Decoder** -- Combinational opcode-to-control-signal translation for 41 WASM opcodes
+   (34 original + 7 control flow). See [Decoder docs](decoder.md).
+
+4. **Fetch Unit** -- Sequential bytecode fetch with program counter, LEB128 variable-length
+   immediate decoding, and control flow integration. 7-state FSM handling opcode fetch,
+   immediate accumulation, block type skipping, and branch resolution via the branch
+   table. See [Fetch docs](fetch.md).
+
+5. **Branch Table** -- Precomputed branch target RAM populated by an off-chip loader.
+   Maps source PCs to resolved target PCs for block/loop/if/else/br/br_if instructions.
+   Eliminates the need for runtime label stack traversal or forward-scanning.
+   See [Branch Table docs](branch_table.md).
 
 ## Next up
-
-4. **Fetch Unit** -- Reads bytecode from program memory and advances the program counter.
-   Needs to handle LEB128 variable-length encoding for immediates (i32.const values,
-   branch targets, local indices, etc.). This is the first sequential module in the
-   pipeline -- it maintains a PC register and steps through the bytecode stream.
-
-5. **Control Flow** -- WASM has structured control flow (block/loop/if/br/br_if/br_table).
-   This requires a label stack to track nesting and resolve branch targets. Probably
-   the trickiest module to get right -- WASM's structured control flow is unusual
-   compared to traditional branch/jump architectures.
 
 6. **Linear Memory** -- WASM's flat byte-addressable memory. Needs to support i32.load,
    i32.store, and their 8/16-bit variants with sign/zero extension. Will need to handle

@@ -1,0 +1,180 @@
+/// Branch table for WASM structured control flow.
+///
+/// Simple dual-port RAM that maps source PCs to jump target PCs. Populated
+/// by an off-chip loader before execution begins. The fetch unit reads from
+/// it at runtime to resolve branch targets in a single cycle.
+///
+/// Each entry stores a valid bit and a 32-bit target PC. Entries are indexed
+/// by the lower bits of the source PC (direct-mapped). This wastes some space
+/// but keeps the lookup trivial -- no hashing, no CAM, just an array index.
+///
+/// The loader is responsible for:
+///   - Scanning the bytecode to find all control flow instructions
+///   - Computing the matching end/else/loop-start addresses
+///   - Resolving br/br_if depth values to absolute target PCs
+///   - Writing entries via the write port before asserting start on the core
+///
+/// Write port is active only during loading (before execution). Read port is
+/// combinational (asynchronous read) for zero-latency lookups by the fetch unit.
+module WasmBranchTable #(
+    param DEPTH: u32 = 256, /// Number of entries (should be >= max program size)
+) (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // Loader write port (active during program loading)
+    i_wr_en  : input logic    , /// Write enable
+    i_wr_addr: input logic<32>, /// Source PC (index)
+    i_wr_data: input logic<32>, /// Target PC
+
+    // Fetch unit read port (combinational)
+    i_rd_addr : input  logic<32>, /// Source PC to look up
+    o_rd_data : output logic<32>, /// Target PC at that entry
+    o_rd_valid: output logic    , /// Entry has been written (valid)
+) {
+    const ADDR_WIDTH: u32 = $clog2(DEPTH);
+
+    // Storage: target PC + valid bit per entry
+    var targets: logic<32> [DEPTH];
+    var valid  : logic     [DEPTH];
+
+    // Combinational read -- zero-latency lookup
+    let rd_idx    : logic<ADDR_WIDTH> = i_rd_addr[ADDR_WIDTH - 1:0];
+    assign o_rd_data  = targets[rd_idx];
+    assign o_rd_valid = valid[rd_idx];
+
+    // Synchronous write + reset
+    let wr_idx: logic<ADDR_WIDTH> = i_wr_addr[ADDR_WIDTH - 1:0];
+
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            // Clear all valid bits on reset
+            for i: u32 in 0..DEPTH {
+                valid[i] = 0;
+            }
+        } else {
+            if i_wr_en {
+                targets[wr_idx] = i_wr_data;
+                valid[wr_idx]   = 1;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Testbench -- exercises write/read, valid bits, and reset behaviour.
+// Run with: veryl test --sim verilator
+// ---------------------------------------------------------------------------
+#[test(test_wasm_branch_table)]
+embed (inline) sv{{{
+module test_wasm_branch_table;
+    logic        clk, rst;
+    logic        wr_en;
+    logic [31:0] wr_addr, wr_data;
+    logic [31:0] rd_addr, rd_data;
+    logic        rd_valid;
+    int          pass_count, fail_count;
+
+    hello_WasmBranchTable #(.DEPTH(16)) u_bt (
+        .i_clk      (clk     ),
+        .i_rst      (rst     ),
+        .i_wr_en    (wr_en   ),
+        .i_wr_addr  (wr_addr ),
+        .i_wr_data  (wr_data ),
+        .i_rd_addr  (rd_addr ),
+        .o_rd_data  (rd_data ),
+        .o_rd_valid (rd_valid)
+    );
+
+    // Clock: 10 time-unit period
+    initial clk = 0;
+    always #5 clk = ~clk;
+
+    task write_entry(input [31:0] addr, input [31:0] data);
+        wr_en   = 1;
+        wr_addr = addr;
+        wr_data = data;
+        @(posedge clk); #1;
+        wr_en = 0;
+    endtask
+
+    task check_read(input string name, input [31:0] addr,
+                    input [31:0] exp_data, input exp_valid);
+        rd_addr = addr;
+        #1; // combinational settle
+        if (rd_data !== exp_data || rd_valid !== exp_valid) begin
+            $error("%s: addr=%0d data=0x%08h valid=%0b | expected data=0x%08h valid=%0b",
+                   name, addr, rd_data, rd_valid, exp_data, exp_valid);
+            fail_count++;
+        end else begin
+            pass_count++;
+        end
+    endtask
+
+    initial begin
+        pass_count = 0;
+        fail_count = 0;
+        wr_en = 0; wr_addr = 0; wr_data = 0; rd_addr = 0;
+
+        // --- Reset ---
+        rst = 0;
+        @(posedge clk); #1;
+        rst = 1;
+        @(posedge clk); #1;
+
+        // All entries should be invalid after reset
+        check_read("reset_0", 0, 0, 0);
+        check_read("reset_5", 5, 0, 0);
+        check_read("reset_15", 15, 0, 0);
+
+        // --- Write some entries ---
+        // block at PC=2 -> end at PC=10
+        write_entry(2, 32'd10);
+        // if at PC=5 -> else at PC=8
+        write_entry(5, 32'd8);
+        // br at PC=7 -> target PC=3
+        write_entry(7, 32'd3);
+        // else at PC=8 -> end+1 at PC=10
+        write_entry(8, 32'd10);
+
+        // --- Read back and verify ---
+        check_read("block_2", 2, 32'd10, 1);
+        check_read("if_5", 5, 32'd8, 1);
+        check_read("br_7", 7, 32'd3, 1);
+        check_read("else_8", 8, 32'd10, 1);
+
+        // --- Unwritten entries should be invalid ---
+        check_read("empty_0", 0, 0, 0);
+        check_read("empty_1", 1, 0, 0);
+        check_read("empty_3", 3, 0, 0);
+        check_read("empty_15", 15, 0, 0);
+
+        // --- Overwrite an entry ---
+        write_entry(5, 32'd12);
+        check_read("overwrite_5", 5, 32'd12, 1);
+
+        // --- Reset clears valid bits ---
+        rst = 0;
+        @(posedge clk); #1;
+        rst = 1;
+        @(posedge clk); #1;
+
+        // After reset, valid must be 0 (data is don't-care)
+        rd_addr = 2; #1;
+        if (rd_valid !== 0) begin $error("post_reset_2: valid=%0b expected 0", rd_valid); fail_count++; end
+        else pass_count++;
+        rd_addr = 5; #1;
+        if (rd_valid !== 0) begin $error("post_reset_5: valid=%0b expected 0", rd_valid); fail_count++; end
+        else pass_count++;
+        rd_addr = 7; #1;
+        if (rd_valid !== 0) begin $error("post_reset_7: valid=%0b expected 0", rd_valid); fail_count++; end
+        else pass_count++;
+
+        $display("=== WASM Branch Table Test Complete: %0d passed, %0d failed ===",
+                 pass_count, fail_count);
+        if (fail_count > 0)
+            $error("FAIL: %0d tests failed", fail_count);
+        $finish;
+    end
+endmodule
+}}}

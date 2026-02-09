@@ -9,15 +9,20 @@ the top two values are always available with zero latency.
 ## Interface
 
 ```
-               ┌─────────┐
-  i_data ─────>│  TOS    │──────> o_top   (always available)
-               ├─────────┤
-               │  NOS    │──────> o_next  (always available)
-               ├─────────┤
-               │ stack[0]│
-               │ stack[1]│
-               │   ...   │
-               └─────────┘
+               ┌──────────────────────────┐
+  i_push ─────>│                          │
+  i_pop  ─────>│   ┌──────────┐           ├──> o_top  [32]
+  i_pop2 ─────>│   │   TOS    │───────────┤    (always valid)
+  i_data ─────>│   ├──────────┤           ├──> o_next [32]
+    [32]       │   │   NOS    │───────────┤    (always valid)
+               │   ├──────────┤           │
+               │   │ stack[0] │           ├──> o_empty
+               │   │ stack[1] │           ├──> o_overflow
+               │   │   ...    │           ├──> o_underflow
+               │   │stack[D-3]│           │
+               │   └──────────┘           │
+               │     WasmStack            │
+               └──────────────────────────┘
 ```
 
 | Port | Direction | Width | Description |
@@ -53,6 +58,24 @@ only touched when values shift in/out of the cache.
 This means a binary ALU operation (e.g., `i32.add`) completes in a single cycle:
 pop two operands from TOS/NOS, push the result into TOS, and refill NOS from the
 backing array -- all in one clock edge.
+
+### Example: `i32.add` (pop2 + push) in one cycle
+
+```
+     BEFORE                           AFTER
+  ┌──────────┐                     ┌──────────┐
+  │ TOS = 5  │──┐    ┌─────┐       │ TOS = 8  │ (ALU result)
+  ├──────────┤  └───>│ ALU │       ├──────────┤
+  │ NOS = 3  │──────>│  +  ├──────>│ NOS = 7  │ (promoted from stack[0])
+  ├──────────┤       └─────┘       ├──────────┤
+  │stack[0]=7│                     │stack[0]=9│ (was stack[1])
+  │stack[1]=9│                     │stack[1]=…│
+  └──────────┘                     └──────────┘
+   depth = 4                        depth = 3
+
+  Signals: i_push=1, i_pop2=1, i_data=8 (from ALU)
+  All in a single clock edge.
+```
 
 ## Supported operations
 

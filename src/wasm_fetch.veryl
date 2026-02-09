@@ -1,0 +1,1417 @@
+/// WASM fetch unit -- reads bytecode from program memory and advances the PC.
+///
+/// Sequential module that maintains a program counter and steps through the
+/// bytecode stream one byte at a time. Handles:
+///   - Simple opcodes (1 cycle): ALU ops, nop, drop, end
+///   - Immediates (2+ cycles): i32.const (LEB128 → push to stack)
+///   - Control flow: block/loop/if (skip block type byte), br/br_if (skip
+///     LEB128 depth, then jump via branch table), else (unconditional jump)
+///   - Memory: i32.load/store variants (skip alignment LEB128, accumulate
+///     offset LEB128, then perform memory read/write)
+///
+/// State machine:
+///   IDLE         -- Waiting for i_start.
+///   FETCH_OPCODE -- Read opcode byte at current PC, latch it, advance PC → EXEC.
+///   EXEC         -- Present opcode to decoder. Route to next state based on type.
+///   READ_IMM     -- Accumulate LEB128 bytes for i32.const/mem offset. When done → EXEC_IMM or EXEC_MEM.
+///   EXEC_IMM     -- Present decoded immediate with push signal → FETCH_OPCODE.
+///   SKIP_BLOCK   -- Read and discard block type byte after block/loop/if → decide.
+///   SKIP_IMM     -- Read and discard LEB128 for br/br_if → decide jump or continue.
+///   READ_ALIGN   -- Read and discard alignment LEB128 for memory ops → READ_IMM.
+///   EXEC_MEM     -- Compute effective address, perform memory read/write → FETCH_OPCODE.
+///
+/// Branch table interface:
+///   The module outputs o_bt_addr (the PC of the current control flow instruction)
+///   and reads i_bt_data (the resolved target PC) combinationally.
+///
+/// Program memory interface:
+///   Asynchronous read: o_mem_addr out, i_mem_data in (same cycle).
+module WasmFetch (
+    i_clk: input clock,
+    i_rst: input reset,
+
+    // Control
+    i_start: input logic, /// Pulse high to begin execution from current PC
+    i_stall: input logic, /// Hold high to freeze the pipeline
+
+    // Program memory (asynchronous read)
+    o_mem_addr: output logic<32>, /// Byte address into program memory
+    i_mem_data: input  logic<8> , /// Byte read from program memory
+
+    // To decoder
+    o_opcode   : output logic<8>, /// Current opcode byte
+    o_opcode_en: output logic   , /// Opcode is valid this cycle (strobe)
+
+    // Immediate value (for i32.const)
+    o_immediate: output logic<32>, /// Decoded LEB128 i32 immediate
+    o_imm_push : output logic    , /// Push immediate onto operand stack this cycle
+
+    // Branch table (combinational read, populated by loader)
+    o_bt_addr : output logic<32>, /// PC to look up in branch table
+    i_bt_data : input  logic<32>, /// Target PC from branch table
+    i_bt_valid: input  logic    , /// Branch table entry exists
+
+    // Condition input (from operand stack TOS, latched before pop)
+    i_cond: input logic, /// TOS != 0 (for if / br_if decisions)
+
+    // Stack value inputs (for memory address/data)
+    i_tos: input logic<32>, /// Stack top (base addr for load, value for store)
+    i_nos: input logic<32>, /// Stack next (base addr for store)
+
+    // Linear memory interface (active during ExecMem state)
+    o_lm_rd_addr  : output logic<32>, /// Memory read address
+    o_lm_rd_size  : output logic<2> , /// 0=byte, 1=half, 2=word
+    o_lm_rd_signed: output logic    , /// 1=sign-extend, 0=zero-extend
+    i_lm_rd_data  : input  logic<32>, /// Memory read data (combinational)
+    o_lm_wr_en    : output logic    , /// Memory write enable
+    o_lm_wr_addr  : output logic<32>, /// Memory write address
+    o_lm_wr_size  : output logic<2> , /// 0=byte, 1=half, 2=word
+    o_lm_wr_data  : output logic<32>, /// Memory write data
+    i_lm_rd_trap  : input  logic    , /// Memory read out of bounds
+    i_lm_wr_trap  : input  logic    , /// Memory write out of bounds
+
+    // Data output (for memory loads -- pushed to stack by top-level)
+    o_mem_result   : output logic<32>, /// Result from memory load
+    o_mem_result_en: output logic    , /// Memory result valid (push to stack)
+
+    // Status
+    o_pc     : output logic<32>, /// Current program counter
+    o_running: output logic    , /// 1 while actively fetching/executing
+    o_trap   : output logic    , /// Fetch-level trap (LEB128 overflow, missing branch table entry, memory OOB)
+) {
+    // ---------------------------------------------------------------
+    // State machine
+    // ---------------------------------------------------------------
+    enum State: logic<4> {
+        Idle,
+        FetchOpcode,
+        Exec,
+        ReadImm,
+        ExecImm,
+        SkipBlock,
+        SkipImm,
+        ReadAlign,
+        ExecMem,
+    }
+
+    var state: State    ;
+    var pc   : logic<32>;
+
+    // LEB128 accumulator (for i32.const)
+    var imm_accum: logic<32>;
+    var imm_shift: logic<6> ;
+    var imm_bytes: logic<3> ;
+
+    // Current opcode (latched in FETCH_OPCODE)
+    var cur_opcode: logic<8>;
+
+    // PC of current instruction (for branch table lookup)
+    var instr_pc: logic<32>;
+
+    // Condition latch -- captured during EXEC for if/br_if, used in later states
+    var cond_latch: logic;
+
+    // Local opcode decode (drives state machine without external decoder dependency)
+    let opcode_is_const: logic = cur_opcode == 8'h41;
+    let opcode_is_block: logic = cur_opcode == 8'h02 || cur_opcode == 8'h03;
+    let opcode_is_if   : logic = cur_opcode == 8'h04;
+    let opcode_is_else : logic = cur_opcode == 8'h05;
+    let opcode_is_br   : logic = cur_opcode == 8'h0C;
+    let opcode_is_br_if: logic = cur_opcode == 8'h0D;
+    let opcode_is_load : logic = cur_opcode == 8'h28 || cur_opcode == 8'h2C || cur_opcode == 8'h2D || cur_opcode == 8'h2E || cur_opcode == 8'h2F;
+    let opcode_is_store: logic = cur_opcode == 8'h36 || cur_opcode == 8'h3A || cur_opcode == 8'h3B;
+    let opcode_is_mem  : logic = opcode_is_load || opcode_is_store;
+
+    // Memory operation latches (captured during EXEC, used in EXEC_MEM)
+    var mem_is_store : logic    ;
+    var mem_addr_base: logic<32>;
+    var mem_store_val: logic<32>;
+    var mem_size     : logic<2> ;
+    var mem_signed   : logic    ;
+
+    // ---------------------------------------------------------------
+    // Outputs
+    // ---------------------------------------------------------------
+    assign o_pc       = pc;
+    assign o_running  = state != State::Idle;
+    assign o_mem_addr = pc;
+    assign o_bt_addr  = instr_pc;
+
+    assign o_opcode    = cur_opcode;
+    assign o_opcode_en = state == State::Exec && !i_stall;
+
+    assign o_imm_push = state == State::ExecImm && !i_stall;
+
+    // ---------------------------------------------------------------
+    // LEB128 sign extension for i32
+    // ---------------------------------------------------------------
+    var imm_final: logic<32>;
+
+    always_comb {
+        imm_final = imm_accum;
+
+        case imm_bytes {
+            3'd1: {
+                if imm_accum[6] {
+                    imm_final[31:7] = 25'h1FF_FFFF;
+                }
+            }
+            3'd2: {
+                if imm_accum[13] {
+                    imm_final[31:14] = 18'h3FFFF;
+                }
+            }
+            3'd3: {
+                if imm_accum[20] {
+                    imm_final[31:21] = 11'h7FF;
+                }
+            }
+            3'd4: {
+                if imm_accum[27] {
+                    imm_final[31:28] = 4'hF;
+                }
+            }
+            3'd5: {
+                imm_final = imm_accum;
+            }
+            default: {
+                imm_final = imm_accum;
+            }
+        }
+    }
+
+    assign o_immediate = imm_final;
+
+    // ---------------------------------------------------------------
+    // Linear memory outputs (active only during ExecMem)
+    // ---------------------------------------------------------------
+    let mem_eff_addr: logic<32> = mem_addr_base + imm_final;
+
+    assign o_lm_rd_addr   = mem_eff_addr;
+    assign o_lm_rd_size   = mem_size;
+    assign o_lm_rd_signed = mem_signed;
+    assign o_lm_wr_en     = state == State::ExecMem && mem_is_store && !i_stall;
+    assign o_lm_wr_addr   = mem_eff_addr;
+    assign o_lm_wr_size   = mem_size;
+    assign o_lm_wr_data   = mem_store_val;
+
+    assign o_mem_result    = i_lm_rd_data;
+    assign o_mem_result_en = state == State::ExecMem && !mem_is_store && !i_stall;
+
+    // ---------------------------------------------------------------
+    // Trap
+    // ---------------------------------------------------------------
+    var leb_trap: logic;
+    var bt_trap : logic;
+    var mem_trap: logic;
+    assign o_trap   = leb_trap || bt_trap || mem_trap;
+
+    // ---------------------------------------------------------------
+    // Main state machine
+    // ---------------------------------------------------------------
+    always_ff (i_clk, i_rst) {
+        if_reset {
+            state         = State::Idle;
+            pc            = 0;
+            cur_opcode    = 0;
+            instr_pc      = 0;
+            cond_latch    = 0;
+            imm_accum     = 0;
+            imm_shift     = 0;
+            imm_bytes     = 0;
+            leb_trap      = 0;
+            bt_trap       = 0;
+            mem_trap      = 0;
+            mem_is_store  = 0;
+            mem_addr_base = 0;
+            mem_store_val = 0;
+            mem_size      = 0;
+            mem_signed    = 0;
+        } else if !i_stall {
+            case state {
+                // ----- IDLE: waiting for start signal -----
+                State::Idle: {
+                    leb_trap = 0;
+                    bt_trap  = 0;
+                    mem_trap = 0;
+                    if i_start {
+                        state = State::FetchOpcode;
+                    }
+                }
+
+                // ----- FETCH_OPCODE: latch opcode at current PC, advance -----
+                // o_mem_addr = pc, so i_mem_data = bytecode[pc] this cycle.
+                State::FetchOpcode: {
+                    instr_pc   = pc;
+                    cur_opcode = i_mem_data;
+                    pc         = pc + 1;
+                    state      = State::Exec;
+                }
+
+                // ----- EXEC: opcode presented to decoder this cycle -----
+                State::Exec: {
+                    if opcode_is_const {
+                        // i32.const: read LEB128 immediate
+                        imm_accum = 0;
+                        imm_shift = 0;
+                        imm_bytes = 0;
+                        state     = State::ReadImm;
+                    } else if opcode_is_block || opcode_is_if {
+                        // block/loop/if: skip the block type byte
+                        if opcode_is_if {
+                            cond_latch = i_cond;
+                        }
+                        state = State::SkipBlock;
+                    } else if opcode_is_else {
+                        // else: unconditional jump via branch table
+                        if i_bt_valid {
+                            pc    = i_bt_data;
+                            state = State::FetchOpcode;
+                        } else {
+                            bt_trap = 1;
+                            state   = State::Idle;
+                        }
+                    } else if opcode_is_br || opcode_is_br_if {
+                        // br/br_if: read LEB128 depth (discard value, use branch table)
+                        if opcode_is_br_if {
+                            cond_latch = i_cond;
+                        }
+                        imm_accum = 0;
+                        imm_shift = 0;
+                        imm_bytes = 0;
+                        state     = State::SkipImm;
+                    } else if opcode_is_mem {
+                        // load/store: latch stack values, then read alignment LEB128
+                        mem_is_store = opcode_is_store;
+                        if opcode_is_store {
+                            mem_addr_base = i_nos;
+                            mem_store_val = i_tos;
+                        } else {
+                            mem_addr_base = i_tos;
+                        }
+                        // Decode mem_size and mem_signed from opcode
+                        case cur_opcode {
+                            8'h28: {
+                                mem_size   = 2'd2;
+                                mem_signed = 0;
+                            } // i32.load
+                            8'h2C: {
+                                mem_size   = 2'd0;
+                                mem_signed = 1;
+                            } // i32.load8_s
+                            8'h2D: {
+                                mem_size   = 2'd0;
+                                mem_signed = 0;
+                            } // i32.load8_u
+                            8'h2E: {
+                                mem_size   = 2'd1;
+                                mem_signed = 1;
+                            } // i32.load16_s
+                            8'h2F: {
+                                mem_size   = 2'd1;
+                                mem_signed = 0;
+                            } // i32.load16_u
+                            8'h36: {
+                                mem_size   = 2'd2;
+                                mem_signed = 0;
+                            } // i32.store
+                            8'h3A: {
+                                mem_size   = 2'd0;
+                                mem_signed = 0;
+                            } // i32.store8
+                            8'h3B: {
+                                mem_size   = 2'd1;
+                                mem_signed = 0;
+                            } // i32.store16
+                            default: {
+                                mem_size   = 2'd2;
+                                mem_signed = 0;
+                            }
+                        }
+                        imm_accum = 0;
+                        imm_shift = 0;
+                        imm_bytes = 0;
+                        state     = State::ReadAlign;
+                    } else {
+                        // Simple instruction -- fetch next opcode
+                        state = State::FetchOpcode;
+                    }
+                }
+
+                // ----- READ_IMM: accumulate LEB128 for i32.const -----
+                State::ReadImm: {
+                    let byte_val    : logic<8>  = i_mem_data;
+                    var payload_wide: logic<32>;
+                    payload_wide = {25'b0, byte_val[6:0]};
+
+                    imm_accum = imm_accum | (payload_wide << imm_shift);
+                    imm_shift = imm_shift + 7;
+                    imm_bytes = imm_bytes + 1;
+                    pc        = pc + 1;
+
+                    if !byte_val[7] {
+                        if opcode_is_mem {
+                            state = State::ExecMem;
+                        } else {
+                            state = State::ExecImm;
+                        }
+                    } else if imm_bytes == 4 {
+                        leb_trap = 1;
+                        state    = State::Idle;
+                    }
+                }
+
+                // ----- EXEC_IMM: present immediate, then fetch next opcode -----
+                State::ExecImm: {
+                    state = State::FetchOpcode;
+                }
+
+                // ----- SKIP_BLOCK: read and discard block type byte -----
+                State::SkipBlock: {
+                    // Block type byte is at current PC. Skip it.
+                    pc = pc + 1;
+
+                    if opcode_is_if && !cond_latch {
+                        // if with false condition: jump to else/end via branch table
+                        if i_bt_valid {
+                            pc    = i_bt_data;
+                            state = State::FetchOpcode;
+                        } else {
+                            bt_trap = 1;
+                            state   = State::Idle;
+                        }
+                    } else {
+                        // block/loop, or if with true condition: continue to next opcode
+                        state = State::FetchOpcode;
+                    }
+                }
+
+                // ----- SKIP_IMM: read and discard LEB128 for br/br_if -----
+                State::SkipImm: {
+                    let byte_val : logic<8> = i_mem_data;
+                    pc        = pc + 1;
+                    imm_bytes = imm_bytes + 1;
+
+                    if !byte_val[7] {
+                        // Last LEB128 byte. Decide: jump or continue?
+                        // br: always jump
+                        // br_if: jump if cond_latch (TOS != 0)
+                        var do_jump: logic;
+                        do_jump = opcode_is_br || (opcode_is_br_if && cond_latch);
+
+                        if do_jump {
+                            if i_bt_valid {
+                                pc    = i_bt_data;
+                                state = State::FetchOpcode;
+                            } else {
+                                bt_trap = 1;
+                                state   = State::Idle;
+                            }
+                        } else {
+                            // br_if not taken: continue to next opcode
+                            state = State::FetchOpcode;
+                        }
+                    } else if imm_bytes == 4 {
+                        leb_trap = 1;
+                        state    = State::Idle;
+                    }
+                }
+
+                // ----- READ_ALIGN: read and discard alignment LEB128 -----
+                State::ReadAlign: {
+                    let byte_val : logic<8> = i_mem_data;
+                    pc        = pc + 1;
+                    imm_bytes = imm_bytes + 1;
+
+                    if !byte_val[7] {
+                        // Alignment consumed. Reset accum for offset LEB128.
+                        imm_accum = 0;
+                        imm_shift = 0;
+                        imm_bytes = 0;
+                        state     = State::ReadImm;
+                    } else if imm_bytes == 4 {
+                        leb_trap = 1;
+                        state    = State::Idle;
+                    }
+                }
+
+                // ----- EXEC_MEM: compute effective address, perform memory op -----
+                State::ExecMem: {
+                    if mem_is_store {
+                        if i_lm_wr_trap {
+                            mem_trap = 1;
+                            state    = State::Idle;
+                        } else {
+                            // Write is driven combinationally via o_lm_wr_en
+                            state = State::FetchOpcode;
+                        }
+                    } else {
+                        if i_lm_rd_trap {
+                            mem_trap = 1;
+                            state    = State::Idle;
+                        } else {
+                            // Read result is driven combinationally via o_mem_result
+                            state = State::FetchOpcode;
+                        }
+                    }
+                }
+
+                default: {
+                    state = State::Idle;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Testbench
+// Run with: veryl test --sim verilator
+// ---------------------------------------------------------------------------
+#[test(test_wasm_fetch)]
+embed (inline) sv{{{
+module test_wasm_fetch;
+    logic        clk, rst;
+    logic        start, stall;
+    logic [31:0] mem_addr;
+    logic [7:0]  mem_data;
+    logic [7:0]  opcode;
+    logic        opcode_en;
+    logic [31:0] immediate;
+    logic        imm_push;
+    logic [31:0] bt_addr, bt_data;
+    logic        bt_valid;
+    logic        cond;
+    logic [31:0] tos, nos;
+    logic [31:0] lm_rd_addr, lm_rd_data;
+    logic [1:0]  lm_rd_size;
+    logic        lm_rd_signed;
+    logic        lm_wr_en;
+    logic [31:0] lm_wr_addr, lm_wr_data;
+    logic [1:0]  lm_wr_size;
+    logic        lm_rd_trap, lm_wr_trap;
+    logic [31:0] mem_result;
+    logic        mem_result_en;
+    logic [31:0] pc;
+    logic        running, trap;
+    int          pass_count, fail_count;
+
+    hello_WasmFetch u_fetch (
+        .i_clk          (clk          ),
+        .i_rst          (rst          ),
+        .i_start        (start        ),
+        .i_stall        (stall        ),
+        .o_mem_addr     (mem_addr     ),
+        .i_mem_data     (mem_data     ),
+        .o_opcode       (opcode       ),
+        .o_opcode_en    (opcode_en    ),
+        .o_immediate    (immediate    ),
+        .o_imm_push     (imm_push     ),
+        .o_bt_addr      (bt_addr      ),
+        .i_bt_data      (bt_data      ),
+        .i_bt_valid     (bt_valid     ),
+        .i_cond         (cond         ),
+        .i_tos          (tos          ),
+        .i_nos          (nos          ),
+        .o_lm_rd_addr   (lm_rd_addr  ),
+        .o_lm_rd_size   (lm_rd_size  ),
+        .o_lm_rd_signed (lm_rd_signed),
+        .i_lm_rd_data   (lm_rd_data  ),
+        .o_lm_wr_en     (lm_wr_en    ),
+        .o_lm_wr_addr   (lm_wr_addr  ),
+        .o_lm_wr_size   (lm_wr_size  ),
+        .o_lm_wr_data   (lm_wr_data  ),
+        .i_lm_rd_trap   (lm_rd_trap  ),
+        .i_lm_wr_trap   (lm_wr_trap  ),
+        .o_mem_result    (mem_result   ),
+        .o_mem_result_en (mem_result_en),
+        .o_pc           (pc           ),
+        .o_running      (running      ),
+        .o_trap         (trap         )
+    );
+
+    // Clock: 10 time-unit period
+    initial clk = 0;
+    always #5 clk = ~clk;
+
+    // Program memory: 256-byte ROM
+    logic [7:0] prog_mem [0:255];
+    assign mem_data = prog_mem[mem_addr[7:0]];
+
+    // Branch table: simple array for test (maps PC → target PC)
+    logic [31:0] bt_targets [0:255];
+    logic        bt_valids  [0:255];
+    assign bt_data  = bt_targets[bt_addr[7:0]];
+    assign bt_valid = bt_valids[bt_addr[7:0]];
+
+    // Linear memory model (256 bytes, combinational read, synchronous write)
+    logic [7:0] lin_mem [0:255];
+
+    // Combinational read (matches WasmMemory behavior)
+    always_comb begin
+        lm_rd_trap = (lm_rd_size == 2'd0 && lm_rd_addr >= 256) ||
+                     (lm_rd_size == 2'd1 && lm_rd_addr + 1 >= 256) ||
+                     (lm_rd_size == 2'd2 && lm_rd_addr + 3 >= 256);
+        lm_wr_trap = (lm_wr_size == 2'd0 && lm_wr_addr >= 256) ||
+                     (lm_wr_size == 2'd1 && lm_wr_addr + 1 >= 256) ||
+                     (lm_wr_size == 2'd2 && lm_wr_addr + 3 >= 256);
+
+        case (lm_rd_size)
+            2'd0: begin // byte
+                if (lm_rd_signed && lin_mem[lm_rd_addr[7:0]][7])
+                    lm_rd_data = {24'hFFFFFF, lin_mem[lm_rd_addr[7:0]]};
+                else
+                    lm_rd_data = {24'h0, lin_mem[lm_rd_addr[7:0]]};
+            end
+            2'd1: begin // half
+                if (lm_rd_signed && lin_mem[lm_rd_addr[7:0] + 1][7])
+                    lm_rd_data = {16'hFFFF, lin_mem[lm_rd_addr[7:0] + 1], lin_mem[lm_rd_addr[7:0]]};
+                else
+                    lm_rd_data = {16'h0, lin_mem[lm_rd_addr[7:0] + 1], lin_mem[lm_rd_addr[7:0]]};
+            end
+            2'd2: begin // word
+                lm_rd_data = {lin_mem[lm_rd_addr[7:0] + 3], lin_mem[lm_rd_addr[7:0] + 2],
+                              lin_mem[lm_rd_addr[7:0] + 1], lin_mem[lm_rd_addr[7:0]]};
+            end
+            default: lm_rd_data = 32'h0;
+        endcase
+    end
+
+    // Synchronous write
+    always @(posedge clk) begin
+        if (lm_wr_en && !lm_wr_trap) begin
+            case (lm_wr_size)
+                2'd0: lin_mem[lm_wr_addr[7:0]] <= lm_wr_data[7:0];
+                2'd1: begin
+                    lin_mem[lm_wr_addr[7:0]]     <= lm_wr_data[7:0];
+                    lin_mem[lm_wr_addr[7:0] + 1] <= lm_wr_data[15:8];
+                end
+                2'd2: begin
+                    lin_mem[lm_wr_addr[7:0]]     <= lm_wr_data[7:0];
+                    lin_mem[lm_wr_addr[7:0] + 1] <= lm_wr_data[15:8];
+                    lin_mem[lm_wr_addr[7:0] + 2] <= lm_wr_data[23:16];
+                    lin_mem[lm_wr_addr[7:0] + 3] <= lm_wr_data[31:24];
+                end
+                default: ;
+            endcase
+        end
+    end
+
+    // ---------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------
+    task do_reset();
+        rst = 0;
+        @(posedge clk); #1;
+        rst = 1;
+        @(posedge clk); #1;
+        // Clear branch table valid bits
+        for (int i = 0; i < 256; i++) begin
+            bt_valids[i] = 0;
+            bt_targets[i] = 0;
+            lin_mem[i] = 0;
+        end
+        start = 0; stall = 0; cond = 0;
+        tos = 0; nos = 0;
+    endtask
+
+    task idle();
+        start = 0; stall = 0;
+        @(posedge clk); #1;
+    endtask
+
+    task check_opcode(input string name, input [7:0] exp_opc, input [31:0] exp_pc);
+        if (opcode !== exp_opc || !opcode_en) begin
+            $error("%s: opcode=0x%02h en=%0b pc=%0d | expected opcode=0x%02h en=1 pc=%0d",
+                   name, opcode, opcode_en, pc, exp_opc, exp_pc);
+            fail_count++;
+        end else if (pc !== exp_pc) begin
+            $error("%s: pc=%0d | expected pc=%0d", name, pc, exp_pc);
+            fail_count++;
+        end else begin
+            pass_count++;
+        end
+    endtask
+
+    task check_imm(input string name, input [31:0] exp_imm);
+        if (!imm_push) begin
+            $error("%s: imm_push=0 | expected imm_push=1", name);
+            fail_count++;
+        end else if (immediate !== exp_imm) begin
+            $error("%s: immediate=0x%08h | expected 0x%08h", name, immediate, exp_imm);
+            fail_count++;
+        end else begin
+            pass_count++;
+        end
+    endtask
+
+    initial begin
+        pass_count = 0;
+        fail_count = 0;
+        start = 0; stall = 0; cond = 0;
+
+        // =========================================================
+        // Test 1: simple opcode sequence (no immediates, no branches)
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h6A;  // i32.add
+        prog_mem[1] = 8'h6B;  // i32.sub
+        prog_mem[2] = 8'h01;  // nop
+        prog_mem[3] = 8'h1A;  // drop
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        // FETCH_OPCODE cycle
+        idle();
+        check_opcode("t1_add", 8'h6A, 1);
+
+        idle(); // FETCH_OPCODE for next
+        idle(); // EXEC
+        check_opcode("t1_sub", 8'h6B, 2);
+
+        idle();
+        idle();
+        check_opcode("t1_nop", 8'h01, 3);
+
+        idle();
+        idle();
+        check_opcode("t1_drop", 8'h1A, 4);
+
+        // =========================================================
+        // Test 2: i32.const 42 (single-byte LEB128)
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h41;  // i32.const
+        prog_mem[1] = 8'h2A;  // 42
+        prog_mem[2] = 8'h6A;  // i32.add
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t2_const", 8'h41, 1);
+
+        idle(); // READ_IMM (byte 0x2A, no continuation)
+        idle(); // EXEC_IMM
+        check_imm("t2_imm42", 32'd42);
+
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        check_opcode("t2_add", 8'h6A, 3);
+
+        // =========================================================
+        // Test 3: i32.const -1 (sign extension)
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h41;
+        prog_mem[1] = 8'h7F;  // -1 in signed LEB128
+        prog_mem[2] = 8'h01;  // nop
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t3_const", 8'h41, 1);
+        idle(); // READ_IMM
+        idle(); // EXEC_IMM
+        check_imm("t3_neg1", 32'hFFFF_FFFF);
+
+        // =========================================================
+        // Test 4: i32.const 128 (2-byte LEB128)
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h41;
+        prog_mem[1] = 8'h80;  // continuation
+        prog_mem[2] = 8'h01;  // final byte
+        prog_mem[3] = 8'h01;  // nop
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t4_const", 8'h41, 1);
+        idle(); // READ_IMM byte 1 (0x80, continuation)
+        idle(); // READ_IMM byte 2 (0x01, final)
+        idle(); // EXEC_IMM
+        check_imm("t4_128", 32'd128);
+
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        check_opcode("t4_nop", 8'h01, 4);
+
+        // =========================================================
+        // Test 5: block + end (block type 0x40 = void)
+        //   PC 0: block (0x02)
+        //   PC 1: block type 0x40
+        //   PC 2: nop (0x01)
+        //   PC 3: end (0x0B)
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h02;  // block
+        prog_mem[1] = 8'h40;  // block type: void
+        prog_mem[2] = 8'h01;  // nop
+        prog_mem[3] = 8'h0B;  // end
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t5_block", 8'h02, 1);
+
+        idle(); // SKIP_BLOCK (reads and skips 0x40)
+        idle(); // FETCH_OPCODE at PC=2
+        idle(); // EXEC
+        check_opcode("t5_nop", 8'h01, 3);
+
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        check_opcode("t5_end", 8'h0B, 4);
+
+        // =========================================================
+        // Test 6: if (true) -- enters if body
+        //   PC 0: if (0x04)
+        //   PC 1: block type 0x40
+        //   PC 2: nop (if body)
+        //   PC 3: end (0x0B)
+        //   Branch table: PC 0 → PC 4 (else/end target, not used when true)
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h04;  // if
+        prog_mem[1] = 8'h40;  // block type
+        prog_mem[2] = 8'h01;  // nop (if body)
+        prog_mem[3] = 8'h0B;  // end
+        bt_targets[0] = 32'd4; bt_valids[0] = 1;  // if at PC0 → end+1
+
+        cond = 1;  // TOS != 0 → true
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t6_if", 8'h04, 1);
+
+        idle(); // SKIP_BLOCK (condition true → continue)
+        idle(); // FETCH_OPCODE at PC=2
+        idle(); // EXEC
+        check_opcode("t6_nop", 8'h01, 3);
+
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        check_opcode("t6_end", 8'h0B, 4);
+
+        // =========================================================
+        // Test 7: if (false) -- jumps to end
+        //   Same program as test 6 but condition is false.
+        //   Should jump to PC 4 (past end).
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h04;  // if
+        prog_mem[1] = 8'h40;  // block type
+        prog_mem[2] = 8'h01;  // nop (if body -- SKIPPED)
+        prog_mem[3] = 8'h0B;  // end -- SKIPPED
+        prog_mem[4] = 8'h6A;  // add (after the if)
+        bt_targets[0] = 32'd4; bt_valids[0] = 1;
+
+        cond = 0;  // TOS == 0 → false
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t7_if", 8'h04, 1);
+
+        idle(); // SKIP_BLOCK (condition false → jump to PC 4)
+        idle(); // FETCH_OPCODE at PC=4
+        idle(); // EXEC
+        check_opcode("t7_add", 8'h6A, 5);
+
+        // =========================================================
+        // Test 8: if/else -- true path
+        //   PC 0: if (0x04)
+        //   PC 1: block type 0x40
+        //   PC 2: nop (if body)
+        //   PC 3: else (0x05)
+        //   PC 4: nop (else body)
+        //   PC 5: end (0x0B)
+        //   PC 6: add
+        //   Branch table: PC 0 → PC 4 (else body), PC 3 → PC 6 (end+1)
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h04;  // if
+        prog_mem[1] = 8'h40;  // block type
+        prog_mem[2] = 8'h6A;  // add (if body)
+        prog_mem[3] = 8'h05;  // else
+        prog_mem[4] = 8'h6B;  // sub (else body)
+        prog_mem[5] = 8'h0B;  // end
+        prog_mem[6] = 8'h01;  // nop (after if/else)
+        bt_targets[0] = 32'd4; bt_valids[0] = 1;  // if false → else body
+        bt_targets[3] = 32'd6; bt_valids[3] = 1;  // else → end+1
+
+        cond = 1;  // true → enter if body
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t8_if", 8'h04, 1);
+
+        idle(); // SKIP_BLOCK (true → continue)
+        idle(); // FETCH_OPCODE at PC=2
+        idle(); // EXEC: add (if body)
+        check_opcode("t8_add", 8'h6A, 3);
+
+        idle(); // FETCH_OPCODE at PC=3
+        idle(); // EXEC: else → jump to PC 6
+        check_opcode("t8_else", 8'h05, 4);
+
+        idle(); // FETCH_OPCODE at PC=6
+        idle(); // EXEC: nop (after if/else)
+        check_opcode("t8_after", 8'h01, 7);
+
+        // =========================================================
+        // Test 9: if/else -- false path
+        //   Same program as test 8, condition false.
+        //   Should skip to else body (PC 4), then end jumps past.
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h04;  // if
+        prog_mem[1] = 8'h40;  // block type
+        prog_mem[2] = 8'h6A;  // add (if body -- SKIPPED)
+        prog_mem[3] = 8'h05;  // else -- SKIPPED
+        prog_mem[4] = 8'h6B;  // sub (else body)
+        prog_mem[5] = 8'h0B;  // end
+        prog_mem[6] = 8'h01;  // nop
+        bt_targets[0] = 32'd4; bt_valids[0] = 1;
+        bt_targets[3] = 32'd6; bt_valids[3] = 1;
+
+        cond = 0;  // false → jump to else body
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t9_if", 8'h04, 1);
+
+        idle(); // SKIP_BLOCK (false → jump to PC 4)
+        idle(); // FETCH_OPCODE at PC=4
+        idle(); // EXEC: sub (else body)
+        check_opcode("t9_sub", 8'h6B, 5);
+
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC: end
+        check_opcode("t9_end", 8'h0B, 6);
+
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC: nop
+        check_opcode("t9_nop", 8'h01, 7);
+
+        // =========================================================
+        // Test 10: br 0 (unconditional branch)
+        //   PC 0: block (0x02)
+        //   PC 1: block type 0x40
+        //   PC 2: br 0 (0x0C)
+        //   PC 3: LEB128 depth = 0x00
+        //   PC 4: nop (SKIPPED by br)
+        //   PC 5: end (0x0B)
+        //   PC 6: add (after block)
+        //   Branch table: PC 2 → PC 6 (resolved target for br 0)
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h02;  // block
+        prog_mem[1] = 8'h40;  // block type
+        prog_mem[2] = 8'h0C;  // br
+        prog_mem[3] = 8'h00;  // depth 0
+        prog_mem[4] = 8'h01;  // nop (skipped)
+        prog_mem[5] = 8'h0B;  // end
+        prog_mem[6] = 8'h6A;  // add (after block)
+        bt_targets[2] = 32'd6; bt_valids[2] = 1;
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t10_block", 8'h02, 1);
+
+        idle(); // SKIP_BLOCK
+        idle(); // FETCH_OPCODE at PC=2
+        idle(); // EXEC: br
+        check_opcode("t10_br", 8'h0C, 3);
+
+        idle(); // SKIP_IMM (reads depth 0x00, final → jump to PC 6)
+        idle(); // FETCH_OPCODE at PC=6
+        idle(); // EXEC: add
+        check_opcode("t10_add", 8'h6A, 7);
+
+        // =========================================================
+        // Test 11: br_if taken (TOS != 0)
+        //   PC 0: block (0x02)
+        //   PC 1: block type 0x40
+        //   PC 2: br_if 0 (0x0D)
+        //   PC 3: LEB128 depth = 0x00
+        //   PC 4: nop (skipped if taken)
+        //   PC 5: end
+        //   PC 6: add
+        //   Branch table: PC 2 → PC 6
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h02;  // block
+        prog_mem[1] = 8'h40;  // block type
+        prog_mem[2] = 8'h0D;  // br_if
+        prog_mem[3] = 8'h00;  // depth 0
+        prog_mem[4] = 8'h01;  // nop (skipped)
+        prog_mem[5] = 8'h0B;  // end
+        prog_mem[6] = 8'h6A;  // add
+        bt_targets[2] = 32'd6; bt_valids[2] = 1;
+
+        cond = 1;  // TOS != 0 → take branch
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t11_block", 8'h02, 1);
+        idle(); // SKIP_BLOCK
+        idle(); // FETCH_OPCODE at PC=2
+        idle(); // EXEC: br_if (latches cond=1)
+        check_opcode("t11_brif", 8'h0D, 3);
+
+        idle(); // SKIP_IMM (depth 0x00, cond=1 → jump to PC 6)
+        idle(); // FETCH_OPCODE at PC=6
+        idle(); // EXEC: add
+        check_opcode("t11_add", 8'h6A, 7);
+
+        // =========================================================
+        // Test 12: br_if not taken (TOS == 0)
+        //   Same as test 11 but cond = 0. Should fall through.
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h02;  // block
+        prog_mem[1] = 8'h40;  // block type
+        prog_mem[2] = 8'h0D;  // br_if
+        prog_mem[3] = 8'h00;  // depth 0
+        prog_mem[4] = 8'h01;  // nop (NOT skipped)
+        prog_mem[5] = 8'h0B;  // end
+        prog_mem[6] = 8'h6A;  // add
+        bt_targets[2] = 32'd6; bt_valids[2] = 1;
+
+        cond = 0;  // TOS == 0 → don't branch
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t12_block", 8'h02, 1);
+        idle(); // SKIP_BLOCK
+        idle(); // FETCH_OPCODE at PC=2
+        idle(); // EXEC: br_if (latches cond=0)
+        check_opcode("t12_brif", 8'h0D, 3);
+
+        idle(); // SKIP_IMM (depth 0x00, cond=0 → fall through)
+        idle(); // FETCH_OPCODE at PC=4
+        idle(); // EXEC: nop
+        check_opcode("t12_nop", 8'h01, 5);
+
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC: end
+        check_opcode("t12_end", 8'h0B, 6);
+
+        // =========================================================
+        // Test 13: loop with br 0 (backward jump)
+        //   PC 0: loop (0x03)
+        //   PC 1: block type 0x40
+        //   PC 2: nop (loop body -- executed once, then br loops back)
+        //   PC 3: br 0 (0x0C)
+        //   PC 4: depth 0x00
+        //   PC 5: end (0x0B)
+        //   Branch table: PC 3 → PC 2 (loop start -- backward jump)
+        //
+        //   We'll check that after br, PC goes back to 2 and we see
+        //   the nop again. Then we stop checking (infinite loop).
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h03;  // loop
+        prog_mem[1] = 8'h40;  // block type
+        prog_mem[2] = 8'h01;  // nop (loop body)
+        prog_mem[3] = 8'h0C;  // br
+        prog_mem[4] = 8'h00;  // depth 0
+        prog_mem[5] = 8'h0B;  // end
+        bt_targets[3] = 32'd2; bt_valids[3] = 1;  // br 0 in loop → back to PC 2
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        // First iteration
+        idle(); // FETCH_OPCODE
+        check_opcode("t13_loop", 8'h03, 1);
+        idle(); // SKIP_BLOCK
+        idle(); // FETCH_OPCODE at PC=2
+        idle(); // EXEC: nop
+        check_opcode("t13_nop1", 8'h01, 3);
+        idle(); // FETCH_OPCODE at PC=3
+        idle(); // EXEC: br
+        check_opcode("t13_br", 8'h0C, 4);
+        idle(); // SKIP_IMM → jump back to PC 2
+
+        // Second iteration
+        idle(); // FETCH_OPCODE at PC=2
+        idle(); // EXEC: nop (again!)
+        check_opcode("t13_nop2", 8'h01, 3);
+
+        // =========================================================
+        // Test 14: stall freezes pipeline
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h6A;  // add
+        prog_mem[1] = 8'h6B;  // sub
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        check_opcode("t14_add", 8'h6A, 1);
+
+        stall = 1;
+        @(posedge clk); #1;
+        @(posedge clk); #1;
+        @(posedge clk); #1;
+
+        if (pc !== 1 || opcode !== 8'h6A) begin
+            $error("t14_stall: pc=%0d opcode=0x%02h | expected pc=1 opcode=0x6A", pc, opcode);
+            fail_count++;
+        end else pass_count++;
+
+        stall = 0;
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        check_opcode("t14_sub", 8'h6B, 2);
+
+        // =========================================================
+        // Test 15: branch table miss → trap
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h05;  // else (needs branch table entry)
+        // No branch table entry for PC 0!
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        // EXEC: else, bt_valid=0 → trap
+        idle();
+
+        if (trap !== 1) begin
+            $error("t15_bt_miss: trap=%0b | expected trap=1", trap);
+            fail_count++;
+        end else pass_count++;
+
+        // =========================================================
+        // Test 16: nested blocks with br 1
+        //   PC 0: block (outer)
+        //   PC 1: block type 0x40
+        //   PC 2: block (inner)
+        //   PC 3: block type 0x40
+        //   PC 4: br 1 (0x0C) -- skip out of BOTH blocks
+        //   PC 5: depth 0x01
+        //   PC 6: end (inner)
+        //   PC 7: end (outer)
+        //   PC 8: add (after both blocks)
+        //   Branch table: PC 4 → PC 8 (resolved by loader)
+        // =========================================================
+        do_reset();
+        prog_mem[0] = 8'h02;  // block (outer)
+        prog_mem[1] = 8'h40;  // block type
+        prog_mem[2] = 8'h02;  // block (inner)
+        prog_mem[3] = 8'h40;  // block type
+        prog_mem[4] = 8'h0C;  // br
+        prog_mem[5] = 8'h01;  // depth 1 (target: outer block's end)
+        prog_mem[6] = 8'h0B;  // end (inner)
+        prog_mem[7] = 8'h0B;  // end (outer)
+        prog_mem[8] = 8'h6A;  // add
+        bt_targets[4] = 32'd8; bt_valids[4] = 1;
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE: block (outer)
+        check_opcode("t16_outer", 8'h02, 1);
+        idle(); // SKIP_BLOCK
+        idle(); // FETCH_OPCODE: block (inner)
+        idle(); // EXEC
+        check_opcode("t16_inner", 8'h02, 3);
+        idle(); // SKIP_BLOCK
+        idle(); // FETCH_OPCODE: br
+        idle(); // EXEC
+        check_opcode("t16_br", 8'h0C, 5);
+        idle(); // SKIP_IMM (depth 0x01 → jump to PC 8)
+        idle(); // FETCH_OPCODE at PC=8
+        idle(); // EXEC: add
+        check_opcode("t16_add", 8'h6A, 9);
+
+        // =========================================================
+        // Test 17: i32.store + i32.load (word store then load)
+        //   PC 0: i32.store (0x36) -- alignment=0x00, offset=0x04
+        //   PC 3: i32.load  (0x28) -- alignment=0x02, offset=0x04
+        //
+        //   Store: TOS=value(0xDEADBEEF), NOS=base_addr(0)
+        //     effective addr = 0 + 4 = 4
+        //   Load:  TOS=base_addr(0)
+        //     effective addr = 0 + 4 = 4, should read 0xDEADBEEF
+        //
+        //   Cycle flow (store): FetchOp→Exec→ReadAlign→ReadImm→ExecMem (5 cycles)
+        //   Cycle flow (load):  FetchOp→Exec→ReadAlign→ReadImm→ExecMem (5 cycles)
+        // =========================================================
+        do_reset();
+        // i32.store  align=0  offset=4
+        prog_mem[0] = 8'h36;  // i32.store
+        prog_mem[1] = 8'h00;  // alignment (1 byte, value ignored)
+        prog_mem[2] = 8'h04;  // offset = 4
+        // i32.load   align=2  offset=4
+        prog_mem[3] = 8'h28;  // i32.load
+        prog_mem[4] = 8'h02;  // alignment (1 byte, value ignored)
+        prog_mem[5] = 8'h04;  // offset = 4
+
+        // Set up stack for store: TOS=value, NOS=base_addr
+        tos = 32'hDEADBEEF;
+        nos = 32'h00000000;
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        // --- i32.store ---
+        idle(); // FETCH_OPCODE: latch 0x36, PC→1
+        check_opcode("t17_store", 8'h36, 1);
+
+        idle(); // EXEC: latch TOS/NOS, → ReadAlign
+        idle(); // ReadAlign: consume align byte 0x00, reset accum, → ReadImm
+        idle(); // ReadImm: accumulate offset byte 0x04, → ExecMem
+        idle(); // ExecMem: addr=0+4=4, write 0xDEADBEEF, → FetchOpcode
+
+        // Verify write happened (check lin_mem after sync write edge)
+        if (lin_mem[4] !== 8'hEF || lin_mem[5] !== 8'hBE ||
+            lin_mem[6] !== 8'hAD || lin_mem[7] !== 8'hDE) begin
+            $error("t17_store_mem: lin_mem[4:7]=%02h %02h %02h %02h | expected EF BE AD DE",
+                   lin_mem[4], lin_mem[5], lin_mem[6], lin_mem[7]);
+            fail_count++;
+        end else pass_count++;
+
+        // Set up stack for load: TOS=base_addr
+        tos = 32'h00000000;
+        nos = 32'h00000000;
+
+        // --- i32.load ---
+        idle(); // FETCH_OPCODE: latch 0x28, PC→4
+        check_opcode("t17_load", 8'h28, 4);
+
+        idle(); // EXEC: latch TOS as addr base, → ReadAlign
+        idle(); // ReadAlign: consume align byte 0x02, → ReadImm
+        idle(); // ReadImm: accumulate offset byte 0x04, → ExecMem
+
+        // ExecMem: addr=0+4=4, read combinational → mem_result
+        if (mem_result !== 32'hDEADBEEF) begin
+            $error("t17_load_result: mem_result=0x%08h | expected 0xDEADBEEF", mem_result);
+            fail_count++;
+        end else pass_count++;
+
+        if (!mem_result_en) begin
+            $error("t17_load_en: mem_result_en=%0b | expected 1", mem_result_en);
+            fail_count++;
+        end else pass_count++;
+
+        idle(); // ExecMem → FetchOpcode
+
+        // =========================================================
+        // Test 18: i32.store8 + i32.load8_u + i32.load8_s
+        //   Store byte 0x80 at addr 10, then load unsigned and signed.
+        // =========================================================
+        do_reset();
+        // i32.store8 align=0 offset=10
+        prog_mem[0] = 8'h3A;  // i32.store8
+        prog_mem[1] = 8'h00;  // alignment
+        prog_mem[2] = 8'h0A;  // offset = 10
+        // i32.load8_u align=0 offset=10
+        prog_mem[3] = 8'h2D;  // i32.load8_u
+        prog_mem[4] = 8'h00;  // alignment
+        prog_mem[5] = 8'h0A;  // offset = 10
+        // i32.load8_s align=0 offset=10
+        prog_mem[6] = 8'h2C;  // i32.load8_s
+        prog_mem[7] = 8'h00;  // alignment
+        prog_mem[8] = 8'h0A;  // offset = 10
+
+        // Store: TOS=0x80 (byte value), NOS=0 (base addr)
+        tos = 32'h00000080;
+        nos = 32'h00000000;
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        // --- i32.store8 ---
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        idle(); // ReadAlign
+        idle(); // ReadImm
+        idle(); // ExecMem (write byte 0x80 at addr 10)
+
+        if (lin_mem[10] !== 8'h80) begin
+            $error("t18_store8: lin_mem[10]=0x%02h | expected 0x80", lin_mem[10]);
+            fail_count++;
+        end else pass_count++;
+
+        // Load unsigned: TOS=base_addr=0
+        tos = 32'h00000000;
+
+        // --- i32.load8_u ---
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        idle(); // ReadAlign
+        idle(); // ReadImm
+
+        // ExecMem: read byte at addr 10, zero-extend
+        if (mem_result !== 32'h00000080) begin
+            $error("t18_load8u: mem_result=0x%08h | expected 0x00000080", mem_result);
+            fail_count++;
+        end else pass_count++;
+
+        idle(); // ExecMem → FetchOpcode
+
+        // --- i32.load8_s ---
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        idle(); // ReadAlign
+        idle(); // ReadImm
+
+        // ExecMem: read byte 0x80 at addr 10, sign-extend → 0xFFFFFF80
+        if (mem_result !== 32'hFFFFFF80) begin
+            $error("t18_load8s: mem_result=0x%08h | expected 0xFFFFFF80", mem_result);
+            fail_count++;
+        end else pass_count++;
+
+        idle(); // ExecMem → FetchOpcode
+
+        // =========================================================
+        // Test 19: i32.store16 + i32.load16_u + i32.load16_s
+        //   Store half 0x8000 at addr 20, then load unsigned and signed.
+        // =========================================================
+        do_reset();
+        // i32.store16 align=0 offset=20
+        prog_mem[0] = 8'h3B;  // i32.store16
+        prog_mem[1] = 8'h00;  // alignment
+        prog_mem[2] = 8'h14;  // offset = 20
+        // i32.load16_u align=0 offset=20
+        prog_mem[3] = 8'h2F;  // i32.load16_u
+        prog_mem[4] = 8'h00;  // alignment
+        prog_mem[5] = 8'h14;  // offset = 20
+        // i32.load16_s align=0 offset=20
+        prog_mem[6] = 8'h2E;  // i32.load16_s
+        prog_mem[7] = 8'h00;  // alignment
+        prog_mem[8] = 8'h14;  // offset = 20
+
+        // Store: TOS=0x8000, NOS=0
+        tos = 32'h00008000;
+        nos = 32'h00000000;
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        // --- i32.store16 ---
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        idle(); // ReadAlign
+        idle(); // ReadImm
+        idle(); // ExecMem
+
+        if (lin_mem[20] !== 8'h00 || lin_mem[21] !== 8'h80) begin
+            $error("t19_store16: lin_mem[20:21]=%02h %02h | expected 00 80",
+                   lin_mem[20], lin_mem[21]);
+            fail_count++;
+        end else pass_count++;
+
+        // Load unsigned
+        tos = 32'h00000000;
+
+        // --- i32.load16_u ---
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        idle(); // ReadAlign
+        idle(); // ReadImm
+
+        if (mem_result !== 32'h00008000) begin
+            $error("t19_load16u: mem_result=0x%08h | expected 0x00008000", mem_result);
+            fail_count++;
+        end else pass_count++;
+
+        idle(); // ExecMem → FetchOpcode
+
+        // --- i32.load16_s ---
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        idle(); // ReadAlign
+        idle(); // ReadImm
+
+        if (mem_result !== 32'hFFFF8000) begin
+            $error("t19_load16s: mem_result=0x%08h | expected 0xFFFF8000", mem_result);
+            fail_count++;
+        end else pass_count++;
+
+        idle(); // ExecMem → FetchOpcode
+
+        // =========================================================
+        // Test 20: i32.load with non-zero base address + offset
+        //   Pre-store 0x42 at byte addr 30. Then load with base=20, offset=10.
+        //   Effective addr = 20 + 10 = 30.
+        // =========================================================
+        do_reset();
+        // Pre-populate linear memory
+        lin_mem[30] = 8'h42;
+        lin_mem[31] = 8'h00;
+        lin_mem[32] = 8'h00;
+        lin_mem[33] = 8'h00;
+
+        // i32.load align=0 offset=10
+        prog_mem[0] = 8'h28;  // i32.load
+        prog_mem[1] = 8'h00;  // alignment
+        prog_mem[2] = 8'h0A;  // offset = 10
+
+        tos = 32'h00000014;  // base = 20
+
+        start = 1;
+        @(posedge clk); #1;
+        start = 0;
+
+        idle(); // FETCH_OPCODE
+        idle(); // EXEC
+        idle(); // ReadAlign
+        idle(); // ReadImm
+
+        // ExecMem: addr = 20 + 10 = 30
+        if (mem_result !== 32'h00000042) begin
+            $error("t20_load_offset: mem_result=0x%08h | expected 0x00000042", mem_result);
+            fail_count++;
+        end else pass_count++;
+
+        idle(); // ExecMem → FetchOpcode
+
+        // =========================================================
+        // Summary
+        // =========================================================
+        $display("=== WASM Fetch Test Complete: %0d passed, %0d failed ===",
+                 pass_count, fail_count);
+        if (fail_count > 0)
+            $error("FAIL: %0d tests failed", fail_count);
+        $finish;
+    end
+endmodule
+}}}

@@ -6,12 +6,13 @@
 ///
 /// Supported instruction categories:
 ///   - Control: unreachable (trap), nop, return
+///   - Control flow: block, loop, if, else, end, br, br_if
 ///   - Stack: drop, i32.const
 ///   - i32 ALU: all 29 arithmetic/logic/comparison/unary operations
 ///
 /// Unsupported opcodes decode as trap (o_trap = 1). As more modules are added
-/// (control flow, memory, function calls), this decoder will be extended with
-/// additional output signals and opcode mappings.
+/// (memory, function calls), this decoder will be extended with additional
+/// output signals and opcode mappings.
 module WasmDecode (
     i_opcode: input logic<8>, /// Raw WASM opcode byte
 
@@ -28,19 +29,43 @@ module WasmDecode (
     o_is_const : output logic, /// i32.const -- fetch unit provides the immediate
     o_is_return: output logic, /// return instruction
     o_trap     : output logic, /// Trap: unreachable or invalid opcode
+
+    // Control flow signals
+    o_is_block: output logic, /// block or loop -- has block type immediate to skip
+    o_is_if   : output logic, /// if -- conditional block, has block type immediate
+    o_is_else : output logic, /// else -- unconditional jump to end
+    o_is_end  : output logic, /// end -- close current block
+    o_is_br   : output logic, /// br -- unconditional branch, has LEB128 immediate
+    o_is_br_if: output logic, /// br_if -- conditional branch, has LEB128 immediate
+
+    // Memory signals
+    o_is_load   : output logic   , /// load instruction (i32.load, i32.load8_s, etc.)
+    o_is_store  : output logic   , /// store instruction (i32.store, i32.store8, etc.)
+    o_mem_size  : output logic<2>, /// 0=byte, 1=halfword, 2=word
+    o_mem_signed: output logic   , /// 1=sign-extend load, 0=zero-extend
 ) {
     import WasmAluPkg::*;
 
     always_comb {
         // Defaults: everything off
-        o_alu_op    = AluOp::Add;
-        o_alu_en    = 0;
-        o_push      = 0;
-        o_pop       = 0;
-        o_pop2      = 0;
-        o_is_const  = 0;
-        o_is_return = 0;
-        o_trap      = 0;
+        o_alu_op     = AluOp::Add;
+        o_alu_en     = 0;
+        o_push       = 0;
+        o_pop        = 0;
+        o_pop2       = 0;
+        o_is_const   = 0;
+        o_is_return  = 0;
+        o_trap       = 0;
+        o_is_block   = 0;
+        o_is_if      = 0;
+        o_is_else    = 0;
+        o_is_end     = 0;
+        o_is_br      = 0;
+        o_is_br_if   = 0;
+        o_is_load    = 0;
+        o_is_store   = 0;
+        o_mem_size   = 0;
+        o_mem_signed = 0;
 
         case i_opcode {
             // -------------------------------------------------------
@@ -50,6 +75,29 @@ module WasmDecode (
                 o_trap = 1;
             }
             8'h01: {} // nop -- all outputs stay 0
+            8'h02: { // block (block type byte follows)
+                o_is_block = 1;
+            }
+            8'h03: { // loop (block type byte follows)
+                o_is_block = 1;
+            }
+            8'h04: { // if (pops condition from stack, block type byte follows)
+                o_is_if = 1;
+                o_pop   = 1;
+            }
+            8'h05: { // else (unconditional jump to end)
+                o_is_else = 1;
+            }
+            8'h0B: { // end (close current block)
+                o_is_end = 1;
+            }
+            8'h0C: { // br (LEB128 depth follows)
+                o_is_br = 1;
+            }
+            8'h0D: { // br_if (pops condition, LEB128 depth follows)
+                o_is_br_if = 1;
+                o_pop      = 1;
+            }
             8'h0F: { // return
                 o_is_return = 1;
             }
@@ -63,6 +111,61 @@ module WasmDecode (
             8'h41: { // i32.const (immediate follows in bytecode)
                 o_is_const = 1;
                 o_push     = 1;
+            }
+
+            // -------------------------------------------------------
+            // Memory load
+            // -------------------------------------------------------
+            8'h28: { // i32.load
+                o_is_load  = 1;
+                o_mem_size = 2'd2;
+                o_pop      = 1;
+                o_push     = 1;
+            }
+            8'h2C: { // i32.load8_s
+                o_is_load    = 1;
+                o_mem_size   = 2'd0;
+                o_mem_signed = 1;
+                o_pop        = 1;
+                o_push       = 1;
+            }
+            8'h2D: { // i32.load8_u
+                o_is_load  = 1;
+                o_mem_size = 2'd0;
+                o_pop      = 1;
+                o_push     = 1;
+            }
+            8'h2E: { // i32.load16_s
+                o_is_load    = 1;
+                o_mem_size   = 2'd1;
+                o_mem_signed = 1;
+                o_pop        = 1;
+                o_push       = 1;
+            }
+            8'h2F: { // i32.load16_u
+                o_is_load  = 1;
+                o_mem_size = 2'd1;
+                o_pop      = 1;
+                o_push     = 1;
+            }
+
+            // -------------------------------------------------------
+            // Memory store
+            // -------------------------------------------------------
+            8'h36: { // i32.store
+                o_is_store = 1;
+                o_mem_size = 2'd2;
+                o_pop2     = 1;
+            }
+            8'h3A: { // i32.store8
+                o_is_store = 1;
+                o_mem_size = 2'd0;
+                o_pop2     = 1;
+            }
+            8'h3B: { // i32.store16
+                o_is_store = 1;
+                o_mem_size = 2'd1;
+                o_pop2     = 1;
             }
 
             // -------------------------------------------------------
@@ -285,18 +388,31 @@ module test_wasm_decode;
     logic [7:0] opcode;
     AluOp       alu_op;
     logic       alu_en, push, pop, pop2, is_const, is_return, trap;
+    logic       is_block, is_if, is_else, is_end, is_br, is_br_if;
+    logic       is_load, is_store, mem_signed;
+    logic [1:0] mem_size;
     int         pass_count, fail_count;
 
     hello_WasmDecode u_dec (
-        .i_opcode    (opcode   ),
-        .o_alu_op    (alu_op   ),
-        .o_alu_en    (alu_en   ),
-        .o_push      (push     ),
-        .o_pop       (pop      ),
-        .o_pop2      (pop2     ),
-        .o_is_const  (is_const ),
-        .o_is_return (is_return),
-        .o_trap      (trap     )
+        .i_opcode     (opcode    ),
+        .o_alu_op     (alu_op    ),
+        .o_alu_en     (alu_en    ),
+        .o_push       (push      ),
+        .o_pop        (pop       ),
+        .o_pop2       (pop2      ),
+        .o_is_const   (is_const  ),
+        .o_is_return  (is_return ),
+        .o_trap       (trap      ),
+        .o_is_block   (is_block  ),
+        .o_is_if      (is_if     ),
+        .o_is_else    (is_else   ),
+        .o_is_end     (is_end    ),
+        .o_is_br      (is_br     ),
+        .o_is_br_if   (is_br_if  ),
+        .o_is_load    (is_load   ),
+        .o_is_store   (is_store  ),
+        .o_mem_size   (mem_size  ),
+        .o_mem_signed (mem_signed)
     );
 
     // Check a binary ALU op: expects alu_en=1, pop2=1, push=1, specific alu_op
@@ -410,15 +526,111 @@ module test_wasm_decode;
         check_binary("i32.rotl",  8'h77, AluOp_Rotl);
         check_binary("i32.rotr",  8'h78, AluOp_Rotr);
 
-        // --- Invalid opcodes -> trap ---
-        opcode = 8'h02; #1; // block (unsupported)
-        if (trap !== 1) begin $error("0x02 should trap"); fail_count++; end else pass_count++;
+        // --- Control flow opcodes ---
 
+        // block (0x02) -> is_block=1, no pop, no push, no trap
+        opcode = 8'h02; #1;
+        if (is_block !== 1 || trap !== 0 || alu_en !== 0 || push !== 0 || pop !== 0 || pop2 !== 0) begin
+            $error("block: expected is_block=1 only"); fail_count++;
+        end else pass_count++;
+
+        // loop (0x03) -> is_block=1
+        opcode = 8'h03; #1;
+        if (is_block !== 1 || trap !== 0 || alu_en !== 0 || push !== 0 || pop !== 0 || pop2 !== 0) begin
+            $error("loop: expected is_block=1 only"); fail_count++;
+        end else pass_count++;
+
+        // if (0x04) -> is_if=1, pop=1 (condition)
+        opcode = 8'h04; #1;
+        if (is_if !== 1 || pop !== 1 || trap !== 0 || alu_en !== 0 || push !== 0 || pop2 !== 0) begin
+            $error("if: expected is_if=1, pop=1"); fail_count++;
+        end else pass_count++;
+
+        // else (0x05) -> is_else=1
+        opcode = 8'h05; #1;
+        if (is_else !== 1 || trap !== 0 || alu_en !== 0 || push !== 0 || pop !== 0 || pop2 !== 0) begin
+            $error("else: expected is_else=1 only"); fail_count++;
+        end else pass_count++;
+
+        // end (0x0B) -> is_end=1
+        opcode = 8'h0B; #1;
+        if (is_end !== 1 || trap !== 0 || alu_en !== 0 || push !== 0 || pop !== 0 || pop2 !== 0) begin
+            $error("end: expected is_end=1 only"); fail_count++;
+        end else pass_count++;
+
+        // br (0x0C) -> is_br=1
+        opcode = 8'h0C; #1;
+        if (is_br !== 1 || trap !== 0 || alu_en !== 0 || push !== 0 || pop !== 0 || pop2 !== 0) begin
+            $error("br: expected is_br=1 only"); fail_count++;
+        end else pass_count++;
+
+        // br_if (0x0D) -> is_br_if=1, pop=1 (condition)
+        opcode = 8'h0D; #1;
+        if (is_br_if !== 1 || pop !== 1 || trap !== 0 || alu_en !== 0 || push !== 0 || pop2 !== 0) begin
+            $error("br_if: expected is_br_if=1, pop=1"); fail_count++;
+        end else pass_count++;
+
+        // --- Memory load opcodes ---
+
+        // i32.load (0x28) -> is_load=1, mem_size=2, pop=1, push=1
+        opcode = 8'h28; #1;
+        if (is_load !== 1 || mem_size !== 2'd2 || mem_signed !== 0 || pop !== 1 || push !== 1 || trap !== 0) begin
+            $error("i32.load: expected is_load=1, mem_size=2, pop=1, push=1"); fail_count++;
+        end else pass_count++;
+
+        // i32.load8_s (0x2C) -> is_load=1, mem_size=0, mem_signed=1, pop=1, push=1
+        opcode = 8'h2C; #1;
+        if (is_load !== 1 || mem_size !== 2'd0 || mem_signed !== 1 || pop !== 1 || push !== 1 || trap !== 0) begin
+            $error("i32.load8_s: expected is_load=1, mem_size=0, mem_signed=1"); fail_count++;
+        end else pass_count++;
+
+        // i32.load8_u (0x2D) -> is_load=1, mem_size=0, mem_signed=0
+        opcode = 8'h2D; #1;
+        if (is_load !== 1 || mem_size !== 2'd0 || mem_signed !== 0 || pop !== 1 || push !== 1 || trap !== 0) begin
+            $error("i32.load8_u: expected is_load=1, mem_size=0, mem_signed=0"); fail_count++;
+        end else pass_count++;
+
+        // i32.load16_s (0x2E)
+        opcode = 8'h2E; #1;
+        if (is_load !== 1 || mem_size !== 2'd1 || mem_signed !== 1 || pop !== 1 || push !== 1 || trap !== 0) begin
+            $error("i32.load16_s: expected is_load=1, mem_size=1, mem_signed=1"); fail_count++;
+        end else pass_count++;
+
+        // i32.load16_u (0x2F)
+        opcode = 8'h2F; #1;
+        if (is_load !== 1 || mem_size !== 2'd1 || mem_signed !== 0 || pop !== 1 || push !== 1 || trap !== 0) begin
+            $error("i32.load16_u: expected is_load=1, mem_size=1, mem_signed=0"); fail_count++;
+        end else pass_count++;
+
+        // --- Memory store opcodes ---
+
+        // i32.store (0x36) -> is_store=1, mem_size=2, pop2=1
+        opcode = 8'h36; #1;
+        if (is_store !== 1 || mem_size !== 2'd2 || pop2 !== 1 || push !== 0 || trap !== 0) begin
+            $error("i32.store: expected is_store=1, mem_size=2, pop2=1"); fail_count++;
+        end else pass_count++;
+
+        // i32.store8 (0x3A) -> is_store=1, mem_size=0, pop2=1
+        opcode = 8'h3A; #1;
+        if (is_store !== 1 || mem_size !== 2'd0 || pop2 !== 1 || push !== 0 || trap !== 0) begin
+            $error("i32.store8: expected is_store=1, mem_size=0, pop2=1"); fail_count++;
+        end else pass_count++;
+
+        // i32.store16 (0x3B) -> is_store=1, mem_size=1, pop2=1
+        opcode = 8'h3B; #1;
+        if (is_store !== 1 || mem_size !== 2'd1 || pop2 !== 1 || push !== 0 || trap !== 0) begin
+            $error("i32.store16: expected is_store=1, mem_size=1, pop2=1"); fail_count++;
+        end else pass_count++;
+
+        // --- Invalid opcodes -> trap ---
         opcode = 8'hFF; #1;
         if (trap !== 1) begin $error("0xFF should trap"); fail_count++; end else pass_count++;
 
         opcode = 8'h42; #1; // i64.const (unsupported)
         if (trap !== 1) begin $error("0x42 should trap"); fail_count++; end else pass_count++;
+
+        opcode = 8'h06; #1; // unsupported
+        if (trap !== 1) begin $error("0x06 should trap"); fail_count++; end else pass_count++;
 
         $display("=== WASM Decode Test Complete: %0d passed, %0d failed ===", pass_count, fail_count);
         if (fail_count > 0)
