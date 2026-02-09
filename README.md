@@ -57,10 +57,10 @@ and structured control flow are implemented and tested.
 | `WasmAluPkg` | `src/wasm_alu_pkg.veryl` | Done | [ALU](docs/alu.md) | ALU opcode enum (29 operations) |
 | `WasmAlu` | `src/wasm_alu.veryl` | Done | [ALU](docs/alu.md) | Combinational ALU, all i32 operations |
 | `WasmStack` | `src/wasm_stack.veryl` | Done | [Stack](docs/stack.md) | Operand stack with TOS/NOS caching |
-| `WasmDecode` | `src/wasm_decode.veryl` | Done | [Decoder](docs/decoder.md) | Opcode byte to control signals (41 opcodes) |
+| `WasmDecode` | `src/wasm_decode.veryl` | Done | [Decoder](docs/decoder.md) | Opcode byte to control signals (49 opcodes) |
 | `WasmFetch` | `src/wasm_fetch.veryl` | Done | [Fetch](docs/fetch.md) | PC, bytecode fetch, LEB128, control flow |
 | `WasmBranchTable` | `src/wasm_branch_table.veryl` | Done | [Branch Table](docs/branch_table.md) | Precomputed branch target RAM |
-| Linear Memory | - | TODO | - | Flat memory for load/store |
+| `WasmMemory` | `src/wasm_memory.veryl` | Done | [Memory](docs/memory.md) | Byte-addressable linear memory for load/store |
 | Call Stack | - | TODO | - | Function frames, locals, return addrs |
 | Function Table | - | TODO | - | Indirect call support |
 | Top-level Core | - | TODO | - | Wires everything together |
@@ -77,6 +77,7 @@ src/
   wasm_decode.veryl        -- Instruction decoder + tests
   wasm_fetch.veryl         -- Fetch unit (PC, LEB128, control flow) + tests
   wasm_branch_table.veryl  -- Branch target RAM + tests
+  wasm_memory.veryl        -- Linear memory (byte-addressable RAM) + tests
   hello.veryl              -- Placeholder
 docs/                      -- Detailed module documentation
 target/                    -- Generated SystemVerilog (git-ignored)
@@ -109,6 +110,7 @@ Detailed docs for each module live in [`docs/`](docs/):
 - [ALU](docs/alu.md) -- i32 arithmetic, bitwise, comparison, and unary operations
 - [Operand Stack](docs/stack.md) -- LIFO with TOS/NOS register caching
 - [Decoder](docs/decoder.md) -- opcode to control signal translation
-- [Fetch Unit](docs/fetch.md) -- PC management, LEB128 decoding, control flow
+- [Fetch Unit](docs/fetch.md) -- PC management, LEB128 decoding, control flow, memory ops
 - [Branch Table](docs/branch_table.md) -- precomputed branch target lookup
+- [Linear Memory](docs/memory.md) -- byte-addressable RAM for load/store
 - [Roadmap](docs/roadmap.md) -- what's next and stretch goals

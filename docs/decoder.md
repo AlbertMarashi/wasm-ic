@@ -27,13 +27,19 @@ opcode byte into control signals for the ALU, stack, and fetch unit. No clock, n
                │     o_is_return [1]  (return)             │  │
                │     o_trap      [1]  (invalid/unreachable)│  │
                │                                           │  │
-               │   Control flow ───────────────────────────┘  │
-               │     o_is_block  [1]  (block / loop)          │
-               │     o_is_if     [1]  (if)                    │
-               │     o_is_else   [1]  (else)                  │
-               │     o_is_end    [1]  (end)                   │
-               │     o_is_br     [1]  (br)                    │
-               │     o_is_br_if  [1]  (br_if)                 │
+               │   Control flow ───────────────────────────┤  │
+               │     o_is_block  [1]  (block / loop)       │  │
+               │     o_is_if     [1]  (if)                 │  │
+               │     o_is_else   [1]  (else)               │  │
+               │     o_is_end    [1]  (end)                │  │
+               │     o_is_br     [1]  (br)                 │  │
+               │     o_is_br_if  [1]  (br_if)              │  │
+               │                                           │  │
+               │   Memory ─────────────────────────────────┘  │
+               │     o_is_load    [1]  (load instruction)     │
+               │     o_is_store   [1]  (store instruction)    │
+               │     o_mem_size   [2]  (0=byte,1=half,2=word) │
+               │     o_mem_signed [1]  (sign-extend on load)  │
                └──────────────────────────────────────────────┘
 ```
 
@@ -42,9 +48,9 @@ opcode byte into control signals for the ALU, stack, and fetch unit. No clock, n
 Which outputs fire for each category of instruction:
 
 ```
-                  alu  alu         is_  is_  is_  is_  is_  is_
-                  _en  _op  push pop pop2 const ret trap blk  if else end br br_if
-  ─────────────── ───  ─── ──── ─── ──── ──── ─── ──── ──── ── ──── ─── ── ─────
+                  alu  alu         is_  is_  is_  is_  is_  is_  is_   is_  mem_ mem_
+                  _en  _op  push pop pop2 const ret trap blk  if else end br br_if load store size signed
+  ─────────────── ───  ─── ──── ─── ──── ──── ─── ──── ──── ── ──── ─── ── ───── ──── ───── ──── ──────
   nop                                                    
   unreachable                                  ●         
   return                              ●                  
@@ -58,6 +64,14 @@ Which outputs fire for each category of instruction:
   end                                                  ● 
   br                                                    ●
   br_if                     ●                             ●
+  i32.load             ●   ●                                   ●           2
+  i32.load8_s          ●   ●                                   ●           0     ●
+  i32.load8_u          ●   ●                                   ●           0
+  i32.load16_s         ●   ●                                   ●           1     ●
+  i32.load16_u         ●   ●                                   ●           1
+  i32.store                      ●                                   ●     2
+  i32.store8                     ●                                   ●     0
+  i32.store16                    ●                                   ●     1
   invalid opcode                           ●         
 ```
 
@@ -78,8 +92,12 @@ Which outputs fire for each category of instruction:
 | `o_is_end` | output | 1 | `end` -- close current block |
 | `o_is_br` | output | 1 | `br` -- unconditional branch, LEB128 depth follows |
 | `o_is_br_if` | output | 1 | `br_if` -- conditional branch, pops TOS, LEB128 depth follows |
+| `o_is_load` | output | 1 | Memory load instruction |
+| `o_is_store` | output | 1 | Memory store instruction |
+| `o_mem_size` | output | 2 | Access size: 0=byte, 1=halfword, 2=word |
+| `o_mem_signed` | output | 1 | Sign-extend on load (1=signed, 0=unsigned) |
 
-## Supported opcodes (41 total)
+## Supported opcodes (49 total)
 
 ### Control instructions
 
@@ -164,9 +182,36 @@ These pop 2 values, compute, and push 1 result.
 
 All binary ops set: `alu_en=1, pop2=1, push=1`.
 
+### Memory load instructions
+
+These pop 1 value (base address), compute effective address, read from linear memory,
+and push 1 result.
+
+| Opcode | Instruction | Size | Signed | Signals |
+|--------|-------------|------|--------|---------|
+| `0x28` | `i32.load` | 2 (word) | 0 | `is_load=1, pop=1, push=1` |
+| `0x2C` | `i32.load8_s` | 0 (byte) | 1 | `is_load=1, pop=1, push=1` |
+| `0x2D` | `i32.load8_u` | 0 (byte) | 0 | `is_load=1, pop=1, push=1` |
+| `0x2E` | `i32.load16_s` | 1 (half) | 1 | `is_load=1, pop=1, push=1` |
+| `0x2F` | `i32.load16_u` | 1 (half) | 0 | `is_load=1, pop=1, push=1` |
+
+### Memory store instructions
+
+These pop 2 values (value on top, base address below) and write to linear memory.
+
+| Opcode | Instruction | Size | Signals |
+|--------|-------------|------|---------|
+| `0x36` | `i32.store` | 2 (word) | `is_store=1, pop2=1` |
+| `0x3A` | `i32.store8` | 0 (byte) | `is_store=1, pop2=1` |
+| `0x3B` | `i32.store16` | 1 (half) | `is_store=1, pop2=1` |
+
+All memory instructions have two LEB128 immediates in the bytecode: an alignment hint
+(ignored by hardware) and an offset. The effective address is `base_addr + offset`.
+The fetch unit handles the LEB128 decoding and drives the memory interface.
+
 ### Invalid opcodes
 
-Any opcode not listed above produces `trap=1`. This covers all 222 unrecognized byte
+Any opcode not listed above produces `trap=1`. This covers all 207 unrecognized byte
 values, including future WASM instructions we haven't implemented yet.
 
 ## Design notes
@@ -179,13 +224,13 @@ values, including future WASM instructions we haven't implemented yet.
   `i32.const`. It just sets `o_is_const=1` and `o_push=1` to tell the fetch unit
   "read an LEB128 immediate next" and the stack "you'll be getting a push."
 
-- **Future expansion**: Adding new opcodes (e.g., memory load/store, function calls)
-  means adding more cases and possibly new output signals (e.g., `o_mem_read`,
-  `o_is_call`).
+- **Future expansion**: Adding new opcodes (e.g., function calls, f32/f64 ops) means
+  adding more cases and possibly new output signals (e.g., `o_is_call`).
 
 ## Test coverage
 
-The embedded testbench (`test_wasm_decode`) verifies all 41 supported opcodes plus 3
+The embedded testbench (`test_wasm_decode`) verifies all 49 supported opcodes plus 3
 invalid opcodes (0x06, 0x42, 0xFF). Each test checks the exact combination of output
-signals expected for that instruction category, including the 7 control flow opcodes
-and their associated `pop` signals for `if` and `br_if`.
+signals expected for that instruction category, including the 7 control flow opcodes,
+8 memory opcodes (with `mem_size` and `mem_signed` verification), and their associated
+`pop`/`pop2` signals.

@@ -9,29 +9,29 @@
   ╚═════╤═════╝   ╚═════╤═════╝
         │               │
         v               │
-  ╔═══════════╗         │          ╔══════════════╗
-  ║  Decode   ║         │          ║ Branch Table ║
-  ║ (signals) ║         │          ║   (RAM)      ║
-  ╚═════╤═════╝         │          ╚══════╤═══════╝
-        │               │                 │
-        v               │                 v
-  ╔═══════════════════════════════════════════════╗
-  ║                  Fetch                        ║
-  ║          (PC, FSM, LEB128, control flow)      ║
-  ╚═══════════════════════╤═══════════════════════╝
-                          │
-                          v
-            ┌───────────────────────────┐
-            │       Top-level Core      │
-            │  (wires everything + new  │
-            │   modules below)          │
-            └──────┬──────────┬─────────┘
-                   │          │
-                   v          v
-            ┌──────────┐  ┌──────────┐
-            │  Linear  │  │   Call   │
-            │  Memory  │  │  Stack   │
-            └──────────┘  └──────────┘
+  ╔═══════════╗         │          ╔══════════════╗   ╔══════════════╗
+  ║  Decode   ║         │          ║ Branch Table ║   ║    Linear    ║
+  ║ (signals) ║         │          ║   (RAM)      ║   ║    Memory    ║
+  ╚═════╤═════╝         │          ╚══════╤═══════╝   ╚══════╤═══════╝
+        │               │                 │                   │
+        v               │                 v                   v
+  ╔═══════════════════════════════════════════════════════════════════╗
+  ║                           Fetch                                  ║
+  ║        (PC, FSM, LEB128, control flow, memory load/store)        ║
+  ╚══════════════════════════════╤════════════════════════════════════╝
+                                 │
+                                 v
+               ┌───────────────────────────┐
+               │       Top-level Core      │
+               │  (wires everything + new  │
+               │   modules below)          │
+               └─────────────┬─────────────┘
+                             │
+                             v
+                      ┌──────────┐
+                      │   Call   │
+                      │  Stack   │
+                      └──────────┘
 
   ═══ double border = implemented
   ─── single border = planned
@@ -58,11 +58,13 @@
    Eliminates the need for runtime label stack traversal or forward-scanning.
    See [Branch Table docs](branch_table.md).
 
-## Next up
+6. **Linear Memory** -- WASM's flat byte-addressable memory (`WasmMemory` module).
+   Supports i32.load, i32.store, and their 8/16-bit variants with sign/zero extension.
+   Combinational reads, synchronous writes, loader port, bounds checking. The fetch
+   unit handles the two-LEB128 immediate format (alignment + offset) via ReadAlign
+   and ExecMem states. See [Memory docs](memory.md).
 
-6. **Linear Memory** -- WASM's flat byte-addressable memory. Needs to support i32.load,
-   i32.store, and their 8/16-bit variants with sign/zero extension. Will need to handle
-   alignment and potentially multi-cycle memory access.
+## Next up
 
 7. **Call Stack** -- Function call frames with locals and return addresses. Needed for
    `call` and `return` instructions. Each frame holds a return PC, the caller's
