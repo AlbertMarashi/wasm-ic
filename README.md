@@ -6,7 +6,7 @@ just silicon running WASM instructions directly.
 
 ## Status
 
-Early development. The ALU and operand stack are implemented and tested.
+Early development. The ALU, operand stack, and instruction decoder are implemented and tested.
 
 ## Architecture
 
@@ -16,7 +16,7 @@ Early development. The ALU and operand stack are implemented and tested.
   │                                                  │
   │   ┌───────┐    ┌────────┐    ┌─────────┐        │
   │   │ Fetch │ -> │ Decode │ -> │ Execute │        │
-  │   │ Unit  │    │ Unit   │    │ Unit    │        │
+  │   │ Unit  │    │  <-done│    │ Unit    │        │
   │   └───┬───┘    └────────┘    └────┬────┘        │
   │       │                          │              │
   │  ┌────┴─────┐              ┌─────┴─────┐        │
@@ -39,7 +39,7 @@ Early development. The ALU and operand stack are implemented and tested.
 | `WasmAluPkg` | `src/wasm_alu_pkg.veryl` | Done | ALU opcode enum (29 operations) |
 | `WasmAlu` | `src/wasm_alu.veryl` | Done | Combinational ALU for all WASM i32 operations |
 | `WasmStack` | `src/wasm_stack.veryl` | Done | Operand stack with TOS/NOS caching |
-| Decoder | - | TODO | WASM opcode byte -> control signals |
+| `WasmDecode` | `src/wasm_decode.veryl` | Done | WASM opcode byte -> control signals |
 | Fetch Unit | - | TODO | Reads bytecode from program memory, LEB128 decode |
 | Control Flow | - | TODO | block/loop/if/br/br_if with label stack |
 | Linear Memory | - | TODO | WASM flat memory for load/store instructions |
@@ -54,6 +54,7 @@ src/
   wasm_alu_pkg.veryl   -- AluOp enum definition (Add, Sub, Mul, DivS, ...)
   wasm_alu.veryl       -- Combinational ALU module + tests
   wasm_stack.veryl     -- Operand stack module + tests
+  wasm_decode.veryl    -- Instruction decoder module + tests
   hello.veryl          -- Placeholder (can be removed)
 target/                -- Generated SystemVerilog output (git-ignored)
 dependencies/          -- Veryl standard library (git-ignored)
@@ -144,14 +145,49 @@ Supports simultaneous push+pop for single-cycle ALU operations:
 
 Configurable depth (default 1024). Reports `o_overflow` / `o_underflow` errors.
 
+## How the decoder works
+
+The decoder (`WasmDecode`) is a purely combinational module that translates a raw WASM
+opcode byte into control signals for the ALU and stack. No clock, no state -- it's
+essentially a big lookup table.
+
+```
+               ┌────────────┐
+  i_opcode ───>│            ├──> o_alu_op   (which ALU operation)
+     (8-bit)   │ WasmDecode ├──> o_alu_en   (ALU should execute)
+               │            ├──> o_push     (push result to stack)
+               │            ├──> o_pop      (pop 1 value)
+               │            ├──> o_pop2     (pop 2 values)
+               │            ├──> o_is_const (i32.const instruction)
+               │            ├──> o_is_return(return instruction)
+               │            ├──> o_trap     (invalid/unreachable)
+               └────────────┘
+```
+
+Decodes 34 WASM opcodes:
+
+| Category | Opcodes | Signals set |
+|----------|---------|-------------|
+| Binary ALU (i32.add, sub, mul, ...) | 0x46-0x4F, 0x6A-0x78 | alu_en + pop2 + push |
+| Unary ALU (i32.eqz, clz, ctz, popcnt) | 0x45, 0x67-0x69 | alu_en + pop + push |
+| i32.const | 0x41 | is_const + push |
+| drop | 0x1A | pop |
+| nop | 0x01 | (all zeros) |
+| return | 0x0F | is_return |
+| unreachable | 0x00 | trap |
+| Everything else | - | trap |
+
+The decoder doesn't handle immediate values (e.g., the constant for `i32.const`) --
+that's the fetch unit's job. The decoder only says "this instruction needs a constant
+pushed" and the fetch unit provides the value.
+
 ## Roadmap
 
 Roughly in order of implementation:
 
 1. ~~**Operand Stack**~~ -- Done. See `src/wasm_stack.veryl`.
 
-2. **Decoder** -- takes a WASM opcode byte and emits control signals: which ALU op,
-   whether to push/pop the stack, memory access type, branch signals, etc.
+2. ~~**Decoder**~~ -- Done. See `src/wasm_decode.veryl`.
 
 3. **Fetch Unit** -- reads bytecode from program memory, advances the program counter.
    Needs to handle LEB128 variable-length encoding for immediates (i32.const values,
